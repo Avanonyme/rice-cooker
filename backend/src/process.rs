@@ -9,22 +9,10 @@ use anyhow::{Context, Result, anyhow};
 const NOTIFIERS: &[&str] = &["dunst", "mako", "swaync"];
 const KILL_POLL_MS: u64 = 50;
 const KILL_WAIT_MS: u64 = 500;
-// Observed rendering timings on a fast laptop and VM harness (Hyprland):
-//   dms / linux-retroism: <1s to first layer
-//   noctalia / dms first launch in VMs: can exceed 5s
-// Fast rices return in one iteration; slow rices get enough runway.
 const VERIFY_POLL_MS: u64 = 250;
 const VERIFY_TIMEOUT_MS: u64 = 10_000;
 const LOG_TAIL_LINES: usize = 20;
 
-// Match both `quickshell` and its `qs` symlink, with or without a leading
-// path. `( |$)` after the name guards against `qsfoo`/`quickshellx` false
-// positives; `(^|/)` before handles the path prefix case.
-pub const QS_MATCH_PATTERN: &str = r"(^|/)(quickshell|qs)( |$)";
-
-/// Prevent package-changing activations from running outside the compositor session
-/// that Quickshell must launch into. `XDG_RUNTIME_DIR` is also where qs writes its
-/// own runtime state, so probe it before touching deps.
 pub fn check_graphical_session() -> Result<()> {
     let var = |key| env::var(key).ok().filter(|v| !v.is_empty());
     for key in [
@@ -52,16 +40,8 @@ pub fn check_graphical_session() -> Result<()> {
     Ok(())
 }
 
-/// True when `quickshell -c <name>` has a running process.
 pub fn rice_shell_alive(name: &str) -> Result<bool> {
-    pgrep_matches(&["-xf", &qs_cmdline_pattern(name)])
-}
-
-/// Shared by liveness + verify so they can't desync from launch. `regex::escape`
-/// is load-bearing — catalog names may contain `.`, `+`, etc. that pgrep's BRE
-/// would match too broadly.
-fn qs_cmdline_pattern(name: &str) -> String {
-    format!("quickshell -c {}", regex::escape(name))
+    pgrep_matches(&["-xf", &format!("quickshell -c {name}")])
 }
 
 pub fn kill_notif_daemons() -> Result<()> {
@@ -72,21 +52,21 @@ pub fn kill_notif_daemons() -> Result<()> {
 }
 
 pub fn kill_quickshell() -> Result<()> {
-    run_pkill(&["-TERM", "-f", QS_MATCH_PATTERN])?;
+    run_pkill(&["-TERM", "-x", "quickshell|qs"])?;
 
     let deadline = Instant::now() + Duration::from_millis(KILL_WAIT_MS);
     while Instant::now() < deadline {
-        if !quickshell_running()? {
+        if !pgrep_matches(&["-x", "quickshell|qs"])? {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(KILL_POLL_MS));
     }
 
-    run_pkill(&["-KILL", "-f", QS_MATCH_PATTERN])?;
+    run_pkill(&["-KILL", "-x", "quickshell|qs"])?;
     // `quickshell --no-duplicate` is the default, so a follow-up launch
     // would silently exit if a prior qs survived SIGKILL. Verify it's gone.
     thread::sleep(Duration::from_millis(KILL_POLL_MS));
-    if quickshell_running()? {
+    if pgrep_matches(&["-x", "quickshell|qs"])? {
         return Err(anyhow!(
             "quickshell still running after SIGKILL (possibly D-state)"
         ));
@@ -107,10 +87,6 @@ fn run_pkill(args: &[&str]) -> Result<()> {
         Some(c) => Err(anyhow!("pkill {:?} failed with exit code {}", args, c)),
         None => Err(anyhow!("pkill {:?} terminated by signal", args)),
     }
-}
-
-fn quickshell_running() -> Result<bool> {
-    pgrep_matches(&["-f", QS_MATCH_PATTERN])
 }
 
 // Conflating syntax/fatal with no-match would silently bypass the post-SIGKILL re-verify.
@@ -188,7 +164,7 @@ pub enum VerifyResult {
 }
 
 pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
-    let pat = qs_cmdline_pattern(name);
+    let pat = format!("quickshell -c {name}");
     let deadline = Instant::now() + Duration::from_millis(VERIFY_TIMEOUT_MS);
     let mut hypr_ever_said_no = false;
 
@@ -366,24 +342,5 @@ mod tests {
         let lossy = parse_cmdline(b"\xff\0ok\0");
         assert!(lossy[0].contains('\u{FFFD}'));
         assert_eq!(lossy[1], "ok");
-    }
-
-    #[test]
-    fn qs_match_pattern_matches_both_names_and_rejects_false_positives() {
-        let re = regex::Regex::new(QS_MATCH_PATTERN).unwrap();
-        for cmdline in [
-            "quickshell",
-            "quickshell -p ./shell.qml",
-            "qs",
-            "qs -c clock",
-            "/usr/bin/quickshell -p ./shell.qml",
-            "/usr/bin/qs -c clock",
-            "./qs -c clock",
-        ] {
-            assert!(re.is_match(cmdline), "should match: {cmdline}");
-        }
-        for cmdline in ["quickshellx -p foo", "qsfoo", "/usr/bin/qsfoo -c x"] {
-            assert!(!re.is_match(cmdline), "should not match: {cmdline}");
-        }
     }
 }

@@ -183,7 +183,7 @@ fn run_activate<W: Write>(
         // current.json can be stale (crash, manual kill) — only short-circuit
         // if the process is actually running and the requested deps are present.
         let alive = try_stage!(events, "liveness", process::rice_shell_alive(name));
-        if alive && try_stage!(events, "deps", deps::missing(&selected_deps)).is_empty() {
+        if alive && try_stage!(events, "deps", deps::missing(selected_deps)).is_empty() {
             events.emit(&Event::Success {
                 active: Some(name.to_string()),
             })?;
@@ -208,7 +208,7 @@ fn run_activate<W: Write>(
     step(events, Step::Clone, StepState::Done)?;
 
     step(events, Step::Deps, StepState::Start)?;
-    let deps_outcome = try_stage!(events, "deps", do_deps(paths, name, entry, &selected_deps));
+    let deps_outcome = try_stage!(events, "deps", do_deps(paths, name, entry, selected_deps));
     if deps_outcome.install_error.is_none() {
         step(events, Step::Deps, StepState::Done)?;
     }
@@ -471,9 +471,6 @@ fn fail_and_rollback_activation<W: Write>(
     Ok(false)
 }
 
-/// Launch the captured pre-rice shell (if any) and clear `original`. Always
-/// clears — even on launch failure the captured argv is stale relative to
-/// whatever the user has launched since.
 fn replay_original_shell<W: Write>(paths: &Paths, events: &mut EventWriter<W>) -> Result<bool> {
     let original = try_stage!(events, "replay", "read_original", paths.original());
     let replay_err = if let Some(shell) = original
@@ -580,7 +577,7 @@ pub fn status(paths: &Paths) -> Result<StatusRow> {
 // ── install step helpers ──────────────────────────────────────────────────────
 
 /// True when HEAD matches `commit`; accepts either side as a prefix.
-pub(crate) fn clone_cache_hit(clone_dir: &Path, commit: &str) -> bool {
+fn clone_cache_hit(clone_dir: &Path, commit: &str) -> bool {
     if !clone_dir.join(".git").exists() {
         return false;
     }

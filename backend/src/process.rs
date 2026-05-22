@@ -6,7 +6,6 @@ use std::{env, fs};
 
 use anyhow::{Context, Result, anyhow};
 
-const NOTIFIERS: &[&str] = &["dunst", "mako", "swaync"];
 const KILL_POLL_MS: u64 = 50;
 const KILL_WAIT_MS: u64 = 500;
 const VERIFY_POLL_MS: u64 = 250;
@@ -40,33 +39,29 @@ pub fn check_graphical_session() -> Result<()> {
     Ok(())
 }
 
-pub fn rice_shell_alive(name: &str) -> Result<bool> {
-    pgrep_matches(&["-xf", &format!("quickshell -c {name}")])
-}
-
 pub fn kill_notif_daemons() -> Result<()> {
-    for name in NOTIFIERS {
-        run_pkill(&["-TERM", "-x", name])?;
+    for notifier in ["dunst", "mako", "swaync"] {
+        pkill(&["-TERM", "-x", notifier])?;
     }
     Ok(())
 }
 
 pub fn kill_quickshell() -> Result<()> {
-    run_pkill(&["-TERM", "-x", "quickshell|qs"])?;
+    pkill(&["-TERM", "-x", "quickshell|qs"])?;
 
     let deadline = Instant::now() + Duration::from_millis(KILL_WAIT_MS);
     while Instant::now() < deadline {
-        if !pgrep_matches(&["-x", "quickshell|qs"])? {
+        if pgrep(&["-x", "quickshell|qs"])?.is_empty() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(KILL_POLL_MS));
     }
 
-    run_pkill(&["-KILL", "-x", "quickshell|qs"])?;
+    pkill(&["-KILL", "-x", "quickshell|qs"])?;
     // `quickshell --no-duplicate` is the default, so a follow-up launch
     // would silently exit if a prior qs survived SIGKILL. Verify it's gone.
     thread::sleep(Duration::from_millis(KILL_POLL_MS));
-    if pgrep_matches(&["-x", "quickshell|qs"])? {
+    if !pgrep(&["-x", "quickshell|qs"])?.is_empty() {
         return Err(anyhow!(
             "quickshell still running after SIGKILL (possibly D-state)"
         ));
@@ -74,52 +69,8 @@ pub fn kill_quickshell() -> Result<()> {
     Ok(())
 }
 
-// pkill: 0 matched, 1 no-match, 2 syntax, 3 fatal.
-fn run_pkill(args: &[&str]) -> Result<()> {
-    let status = Command::new("pkill")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawning pkill")?;
-    match status.code() {
-        Some(0) | Some(1) => Ok(()),
-        Some(c) => Err(anyhow!("pkill {:?} failed with exit code {}", args, c)),
-        None => Err(anyhow!("pkill {:?} terminated by signal", args)),
-    }
-}
-
-// Conflating syntax/fatal with no-match would silently bypass the post-SIGKILL re-verify.
-fn pgrep_matches(args: &[&str]) -> Result<bool> {
-    let status = Command::new("pgrep")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawning pgrep")?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        Some(c) => Err(anyhow!("pgrep {:?} failed with exit code {}", args, c)),
-        None => Err(anyhow!("pgrep {:?} terminated by signal", args)),
-    }
-}
-
-fn pgrep_pids(args: &[&str]) -> Result<Vec<u32>> {
-    let out = Command::new("pgrep")
-        .args(args)
-        .stderr(Stdio::null())
-        .output()
-        .context("spawning pgrep")?;
-    match out.status.code() {
-        Some(0) => Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.trim().parse::<u32>().ok())
-            .collect()),
-        Some(1) => Ok(Vec::new()),
-        Some(c) => Err(anyhow!("pgrep {:?} failed with exit code {}", args, c)),
-        None => Err(anyhow!("pgrep {:?} terminated by signal", args)),
-    }
+pub fn rice_shell_alive(name: &str) -> Result<bool> {
+    Ok(!pgrep(&["-xf", &format!("quickshell -c {name}")])?.is_empty())
 }
 
 /// quickshell resolves `<name>` against `$XDG_CONFIG_HOME/quickshell/<name>/shell.qml`
@@ -171,7 +122,7 @@ pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
     loop {
         thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
 
-        let pids = pgrep_pids(&["-xf", &pat])?;
+        let pids = pgrep(&["-xf", &pat])?;
         let alive = !pids.is_empty();
         let log_contents = fs::read_to_string(log_file).unwrap_or_default();
 
@@ -195,7 +146,7 @@ pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
 
         if Instant::now() >= deadline {
             // Re-check liveness: `alive` above is up to VERIFY_POLL_MS stale.
-            if !pgrep_matches(&["-xf", &pat])? {
+            if pgrep(&["-xf", &pat])?.is_empty() {
                 return Ok(VerifyResult::Dead {
                     log_tail: tail_lines_or_placeholder(&log_contents, name),
                 });
@@ -215,60 +166,14 @@ pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
     }
 }
 
-fn tail_lines_or_placeholder(log: &str, name: &str) -> String {
-    if log.is_empty() {
-        format!("<no log content for quickshell -c {name}>")
-    } else {
-        tail_lines(log, LOG_TAIL_LINES)
-    }
-}
-
-/// Some(answer) if hyprctl responded; None on any failure. The `timeout` guard
-/// keeps a wedged compositor from blocking past verify's deadline.
-fn hyprland_owns_layers(pids: &[u32]) -> Option<bool> {
-    let out = Command::new("timeout")
-        .args(["--signal=KILL", "1", "hyprctl", "layers", "-j"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let body = String::from_utf8(out.stdout).ok()?;
-    let root: serde_json::Value = serde_json::from_str(&body).ok()?;
-    // Shape: { "<monitor>": { "levels": { "0": [ {pid, ...}, ... ] } } }
-    let root_obj = root.as_object()?;
-    let pid_set: std::collections::HashSet<u32> = pids.iter().copied().collect();
-    for monitor in root_obj.values() {
-        let Some(levels) = monitor.get("levels").and_then(|v| v.as_object()) else {
-            continue;
-        };
-        for layer_list in levels.values() {
-            let Some(arr) = layer_list.as_array() else {
-                continue;
-            };
-            for layer in arr {
-                if let Some(pid) = layer.get("pid").and_then(|v| v.as_u64())
-                    && pid_set.contains(&(pid as u32))
-                {
-                    return Some(true);
-                }
-            }
-        }
-    }
-    Some(false)
-}
-
 pub fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
 }
 
-// ── /proc introspection: record the user's pre-rice shell ─────────────────────
-
 /// Tolerates the trailing NUL Linux appends; invalid UTF-8 becomes U+FFFD.
-pub fn parse_cmdline(bytes: &[u8]) -> Vec<String> {
+fn parse_cmdline(bytes: &[u8]) -> Vec<String> {
     if bytes.is_empty() {
         return Vec::new();
     }
@@ -321,6 +226,81 @@ pub fn find_running_quickshell() -> Result<Option<QuickshellProc>> {
         }
     }
     Ok(None)
+}
+
+fn pkill(args: &[&str]) -> Result<()> {
+    let status = Command::new("pkill")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("spawning pkill")?;
+    match status.code() {
+        Some(0) | Some(1) => Ok(()),
+        Some(c) => Err(anyhow!("pkill {:?} failed with exit code {}", args, c)),
+        None => Err(anyhow!("pkill {:?} terminated by signal", args)),
+    }
+}
+
+fn pgrep(args: &[&str]) -> Result<Vec<u32>> {
+    let out = Command::new("pgrep")
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .context("spawning pgrep")?;
+    match out.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .collect()),
+        Some(1) => Ok(Vec::new()),
+        Some(c) => Err(anyhow!("pgrep {:?} failed with exit code {}", args, c)),
+        None => Err(anyhow!("pgrep {:?} terminated by signal", args)),
+    }
+}
+
+fn tail_lines_or_placeholder(log: &str, name: &str) -> String {
+    if log.is_empty() {
+        format!("<no log content for quickshell -c {name}>")
+    } else {
+        tail_lines(log, LOG_TAIL_LINES)
+    }
+}
+
+/// Some(answer) if hyprctl responded; None on any failure. The `timeout` guard
+/// keeps a wedged compositor from blocking past verify's deadline.
+fn hyprland_owns_layers(pids: &[u32]) -> Option<bool> {
+    let out = Command::new("timeout")
+        .args(["--signal=KILL", "1", "hyprctl", "layers", "-j"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(out.stdout).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&body).ok()?;
+    // Shape: { "<monitor>": { "levels": { "0": [ {pid, ...}, ... ] } } }
+    let root_obj = root.as_object()?;
+    let pid_set: std::collections::HashSet<u32> = pids.iter().copied().collect();
+    for monitor in root_obj.values() {
+        let Some(levels) = monitor.get("levels").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for layer_list in levels.values() {
+            let Some(arr) = layer_list.as_array() else {
+                continue;
+            };
+            for layer in arr {
+                if let Some(pid) = layer.get("pid").and_then(|v| v.as_u64())
+                    && pid_set.contains(&(pid as u32))
+                {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
 }
 
 #[cfg(test)]

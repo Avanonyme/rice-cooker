@@ -92,6 +92,10 @@ export function PickARice() {
   // backend computes `supported`, so filtering on it cannot drift from what the
   // install engine would accept.
   const [allRices, setAllRices] = useState<RiceListRow[]>([]);
+  // Derived here rather than beside its use below: `selectedRice` reads `rices`
+  // much earlier in the component.
+  const rices = useMemo(() => allRices.filter((row) => row.supported), [allRices]);
+  const hiddenRices = useMemo(() => allRices.filter((row) => !row.supported), [allRices]);
   const [failureActive, setFailureActive] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [pickerExiting, setPickerExiting] = useState(false);
@@ -239,9 +243,6 @@ export function PickARice() {
     lastRiceSoundTargetRef.current = index;
     playRiceSound(sound);
   }, [rices.length]);
-
-  const rices = useMemo(() => allRices.filter((row) => row.supported), [allRices]);
-  const hiddenRices = useMemo(() => allRices.filter((row) => !row.supported), [allRices]);
 
   const configPanelOpen = installConfig !== null;
 

@@ -26,6 +26,8 @@
 
       # The catalog doubles as the list of selectable shells, so the module's
       # `shell` enum can never drift from what the backend actually knows.
+      inherit (nixpkgs) lib;
+
       catalog = builtins.fromTOML (builtins.readFile ./backend/catalog.toml);
       riceNames = builtins.filter (n: n != "_catalog") (builtins.attrNames catalog);
 
@@ -36,6 +38,96 @@
       compositorIds = nixpkgs.lib.unique (
         nixpkgs.lib.concatMap (name: catalog.${name}.compositors or [ "hyprland" ]) riceNames
       );
+
+      # `nix flake check` skips `homeManagerModules`, because it is not a standard
+      # flake output. A module that cannot even evaluate therefore still reports
+      # "all checks passed" — which is what happened: a `lib.optional` precedence
+      # bug made `warnings` throw unconditionally and nothing noticed for two
+      # commits. Evaluating the module here makes it a real gate.
+      hmCase =
+        system:
+        { shell, compositor }:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          # Stands in for the rice's own module, so the `nix.hm_option`
+          # assertion can be satisfied without pulling the rice flake in.
+          riceStub = { lib, ... }: {
+            options.programs.caelestia.enable = lib.mkEnableOption "caelestia";
+          };
+        in
+        (home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.default
+            riceStub
+            {
+              home.username = "tester";
+              home.homeDirectory = "/home/tester";
+              home.stateVersion = "25.11";
+            }
+            {
+              programs.rice-cooker = {
+                enable = true;
+                rices.niri-caelestia = { };
+                inherit shell compositor;
+              };
+            }
+            { programs.caelestia.enable = true; }
+          ];
+        }).config;
+
+      # Force `warnings` and `assertions` as well as the values: those are the
+      # options the module writes messages into, and the ones a precedence slip
+      # breaks silently.
+      hmForced =
+        system:
+        { shell, compositor }:
+        let
+          cfg = hmCase system { inherit shell compositor; };
+        in
+        builtins.deepSeq [ cfg.warnings cfg.assertions ] cfg;
+
+      hmModuleExpected = {
+        normalizesCase = "niri";
+        sessionVarAgrees = "niri";
+        nullStaysNull = null;
+        rejectsUnknownCompositor = true;
+        rejectsIncompatibleRice = true;
+        launchesTheShell = true;
+      };
+
+      hmModuleResults =
+        system:
+        let
+          rejected = shell: compositor:
+            !(builtins.tryEval (
+              builtins.deepSeq
+                (hmForced system { inherit shell compositor; }).programs.rice-cooker.compositor
+                true
+            )).success;
+          accepted = hmForced system {
+            shell = "niri-caelestia";
+            compositor = "Niri";
+          };
+          unset = hmForced system {
+            shell = "niri-caelestia";
+            compositor = null;
+          };
+        in
+        {
+          normalizesCase = accepted.programs.rice-cooker.compositor;
+          sessionVarAgrees = accepted.home.sessionVariables.RICE_COOKER_COMPOSITOR;
+          nullStaysNull = unset.programs.rice-cooker.compositor;
+          rejectsUnknownCompositor = rejected "niri-caelestia" "sway";
+          rejectsIncompatibleRice = rejected "niri-caelestia" "hyprland";
+          # Home Manager normalises `ExecStart` to a list, so accept either shape.
+          launchesTheShell =
+            let
+              execStart = accepted.systemd.user.services.rice-cooker-shell.Service.ExecStart;
+              parts = if builtins.isList execStart then execStart else [ execStart ];
+            in
+            lib.any (part: lib.hasInfix "caelestia-shell" part) parts;
+        };
 
       perSystem =
         system:
@@ -150,6 +242,21 @@
             }
           );
 
+          # Fails `nix flake check` at evaluation time if the module cannot
+          # evaluate or stops producing what it promises.
+          hmModule =
+            let
+              got = hmModuleResults system;
+            in
+            if got == hmModuleExpected then
+              pkgs.writeText "rice-cooker-hm-module-ok.json" (builtins.toJSON got)
+            else
+              throw ''
+                rice-cooker: the Home Manager module check failed.
+                got:      ${builtins.toJSON got}
+                expected: ${builtins.toJSON hmModuleExpected}
+              '';
+
           default = gui;
         };
     in
@@ -188,7 +295,7 @@
           p = perSystem system;
         in
         {
-          inherit (p) backend typecheck;
+          inherit (p) backend typecheck hmModule;
         }
       );
 
@@ -201,10 +308,14 @@
         rice-cooker = self.homeManagerModules.default;
       };
 
-      # Exposed so downstream configs (and the backend) can read the same list.
+      # Exposed so downstream configs (and the backend) can read the same list,
+      # and so the module's behaviour can be inspected without building:
+      #   nix eval .#lib.hmModuleResults --apply 'f: f "x86_64-linux"'
       lib = {
         inherit catalog riceNames compositorIds;
         catalogPath = ./backend/catalog.toml;
+        hmModuleResults = hmModuleResults;
+        hmModuleExpected = hmModuleExpected;
       };
     };
 }

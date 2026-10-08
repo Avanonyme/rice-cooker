@@ -44,6 +44,12 @@ let
 
   entry = if cfg.shell == null then null else catalog.${cfg.shell};
 
+  # Assertion messages are evaluated whenever `assertions` is forced, even when
+  # the assertion holds, so they must not interpolate a null: `"\${null}"` throws
+  # "cannot coerce null to a string" and would replace a clear message with a
+  # confusing one.
+  show = value: if value == null then "null" else "\"${value}\"";
+
   # Compositors the selected rice declares. Mirrors the backend's default so a
   # v1 entry that omits `compositors` counts as Hyprland-only.
   riceCompositors =
@@ -250,20 +256,23 @@ in
           # contradict, so nothing is asserted.
           assertion = cfg.shell == null || cfg.compositor == null || lib.elem cfg.compositor riceCompositors;
           message = ''
-            programs.rice-cooker: shell = "${toString cfg.shell}" declares
+            programs.rice-cooker: shell = ${show cfg.shell} declares
             compositors [${lib.concatStringsSep ", " (map (c: "\"${c}\"") riceCompositors)}] but
-            compositor = "${cfg.compositor}" was requested. Pick one the rice
+            compositor = ${show cfg.compositor} was requested. Pick one the rice
             supports, or leave `compositor = null` to detect it at runtime.
           '';
         }
       ];
 
-      warnings =
-        lib.optional (cfg.shell != null && competingShells != [ ])
-          "programs.rice-cooker: shell = \"${toString cfg.shell}\" is forced, but "
-          + (lib.concatStringsSep ", " (map (p: lib.concatStringsSep "." p) competingShells))
-          + " is also enabled. Both will try to start a desktop shell; "
-          + "disable the other one or its launcher will race this one.";
+      # Parenthesised deliberately: `lib.optional cond "a" + "b"` parses as
+      # `(lib.optional cond "a") + "b"`, which makes a list the left operand of
+      # `+` and throws unconditionally.
+      warnings = lib.optional (cfg.shell != null && competingShells != [ ]) (
+        "programs.rice-cooker: shell = \"${toString cfg.shell}\" is forced, but "
+        + lib.concatStringsSep ", " (map (p: lib.concatStringsSep "." p) competingShells)
+        + " is also enabled. Both will try to start a desktop shell; "
+        + "disable the other one or its launcher will race this one."
+      );
     }
 
     (mkIf (cfg.compositor != null) {

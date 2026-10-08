@@ -18,8 +18,14 @@ pub fn create_symlink(
     home: &Path,
     config_home: &Path,
 ) -> Result<()> {
-    let src = clone_dir.join(&entry.symlink_src);
-    let dst = expand_config_path(&entry.symlink_dst, home, config_home);
+    let (src_rel, dst_raw) = entry.symlink().ok_or_else(|| {
+        anyhow!(
+            "{}: has no symlink_src/symlink_dst, nothing to install",
+            entry.display_name
+        )
+    })?;
+    let src = clone_dir.join(src_rel);
+    let dst = expand_config_path(dst_raw, home, config_home);
     let parent = dst
         .parent()
         .ok_or_else(|| anyhow!("{}: no parent dir", dst.display()))?;
@@ -77,12 +83,16 @@ mod tests {
             creator_name: "x".into(),
             repo: "https://x".into(),
             commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            symlink_src: src.into(),
-            symlink_dst: dst.into(),
+            symlink_src: Some(src.into()),
+            symlink_dst: Some(dst.into()),
             package_managed: false,
             preview_deps: vec![],
             install_deps: vec![],
             interactive: false,
+            compositors: vec![crate::compositor::CompositorId::Hyprland],
+            layer_namespaces: vec![],
+            launch: None,
+            nix: None,
         }
     }
 

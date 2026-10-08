@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
@@ -646,13 +646,8 @@ fn do_deps(
         &PendingDeps {
             name: name.to_string(),
             commit: entry.commit.clone(),
-            symlink_path: (!entry.package_managed)
-                .then(|| expand_config_path(&entry.symlink_dst, &paths.home, &paths.config_home)),
-            symlink_target: if entry.package_managed {
-                None
-            } else {
-                Some(paths.clone_dir(name)?.join(&entry.symlink_src))
-            },
+            symlink_path: symlink_path_for(paths, entry),
+            symlink_target: symlink_target_for(paths, name, entry)?,
             pre_all: pre_all.clone(),
             pre_explicit: pre_explicit.clone(),
         },
@@ -667,6 +662,29 @@ fn do_deps(
         },
         install_error: install_result.err().map(|e| format!("{e:#}")),
     })
+}
+
+/// Where the rice's config symlink should point, or `None` when nothing is
+/// linked. Shared by the pending-deps journal and the install record so the two
+/// can never disagree about what uninstall has to undo.
+fn symlink_path_for(paths: &Paths, entry: &RiceEntry) -> Option<PathBuf> {
+    if !entry.links_into_config() {
+        return None;
+    }
+    entry
+        .symlink()
+        .map(|(_, dst)| expand_config_path(dst, &paths.home, &paths.config_home))
+}
+
+/// What that symlink points at, or `None` when nothing is linked.
+fn symlink_target_for(paths: &Paths, name: &str, entry: &RiceEntry) -> Result<Option<PathBuf>> {
+    if !entry.links_into_config() {
+        return Ok(None);
+    }
+    match entry.symlink() {
+        Some((src, _)) => Ok(Some(paths.clone_dir(name)?.join(src))),
+        None => Ok(None),
+    }
 }
 
 fn reconcile_pending_deps(paths: &Paths) -> Result<()> {
@@ -703,19 +721,13 @@ fn union_sorted(mut prior: Vec<String>, next: Vec<String>) -> Vec<String> {
 }
 
 fn do_record(paths: &Paths, name: &str, entry: &RiceEntry, pacman_diff: PacmanDiff) -> Result<()> {
-    let symlink_target = if entry.package_managed {
-        None
-    } else {
-        Some(paths.clone_dir(name)?.join(&entry.symlink_src))
-    };
     let record = InstallRecord {
         schema_version: SCHEMA_VERSION,
         name: name.to_string(),
         commit: entry.commit.clone(),
         installed_at: InstallRecord::now_rfc3339(),
-        symlink_path: (!entry.package_managed)
-            .then(|| expand_config_path(&entry.symlink_dst, &paths.home, &paths.config_home)),
-        symlink_target,
+        symlink_path: symlink_path_for(paths, entry),
+        symlink_target: symlink_target_for(paths, name, entry)?,
         pacman_diff,
     };
     save_record(&paths.record_json(name)?, &record)?;
@@ -723,7 +735,7 @@ fn do_record(paths: &Paths, name: &str, entry: &RiceEntry, pacman_diff: PacmanDi
 }
 
 fn do_symlink(paths: &Paths, name: &str, entry: &RiceEntry) -> Result<()> {
-    if entry.package_managed {
+    if !entry.links_into_config() {
         return Ok(());
     }
     let clone = paths.clone_dir(name)?;
@@ -971,11 +983,15 @@ mod tests {
             creator_name: "x".into(),
             repo: "https://x".into(),
             commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            symlink_src: ".".into(),
-            symlink_dst: "~/.config/quickshell/x".into(),
+            symlink_src: Some(".".into()),
+            symlink_dst: Some("~/.config/quickshell/x".into()),
             package_managed: false,
             preview_deps: vec!["preview-a".into(), "preview-b".into()],
             install_deps: vec!["install-a".into(), "install-b".into()],
+            compositors: vec![crate::compositor::CompositorId::Hyprland],
+            layer_namespaces: vec![],
+            launch: None,
+            nix: None,
             interactive: false,
         }
     }

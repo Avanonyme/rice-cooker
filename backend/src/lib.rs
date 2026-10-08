@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod compositor;
 pub mod deps;
 pub mod events;
 pub mod git;

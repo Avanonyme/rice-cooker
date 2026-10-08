@@ -46,27 +46,163 @@ pub fn kill_notif_daemons() -> Result<()> {
     Ok(())
 }
 
+/// Shell process names recognised when identifying "the shell that is running".
+///
+/// `noctalia` is in the list because that is what
+/// `desktop/niri/settings/startup.nix` spawns on this desktop; matching only
+/// `quickshell|qs` meant the running shell was never captured, never evicted and
+/// never replayed.
+///
+/// `quickshell` covers upstream quickshell and the `noctalia-qs` fork through
+/// [`normalize_shell_name`], which unwraps Nix's `.foo-wrapped` naming.
+pub const DEFAULT_SHELL_NAMES: &[&str] = &["quickshell", "qs", "noctalia-qs", "noctalia"];
+
+/// Reduce an argv0 or `/proc/<pid>/exe` path to the name to match on.
+///
+/// Handles three shapes seen in the wild:
+/// - `/nix/store/…-quickshell-1.2/bin/quickshell` → `quickshell`
+/// - `/nix/store/…/bin/.quickshell-wrapped` → `quickshell` (Nix `wrapProgram`)
+/// - `qs` → `qs`
+pub fn normalize_shell_name(raw: &str) -> String {
+    let base = Path::new(raw)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| raw.to_string());
+    let base = base.strip_prefix('.').unwrap_or(&base);
+    let base = base.strip_suffix("-wrapped").unwrap_or(base);
+    base.to_string()
+}
+
+/// Set of shell names considered ours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellMatcher {
+    names: Vec<String>,
+}
+
+impl Default for ShellMatcher {
+    fn default() -> Self {
+        Self {
+            names: DEFAULT_SHELL_NAMES.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+impl ShellMatcher {
+    /// Build from explicit names, normalising and de-duplicating. Duplicates are
+    /// removed so callers can union catalog and default names without care.
+    pub fn new<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut out: Vec<String> = Vec::new();
+        for name in names {
+            let normalized = normalize_shell_name(name.as_ref());
+            // Whitespace-only names are artifacts of splitting a config string,
+            // never real process names.
+            if !normalized.trim().is_empty() && !out.contains(&normalized) {
+                out.push(normalized);
+            }
+        }
+        Self { names: out }
+    }
+
+    /// Defaults plus the catalog's launch binaries, so a rice launched through a
+    /// custom binary is still recognised as a shell.
+    pub fn with_extra<I, S>(extra: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut all: Vec<String> = DEFAULT_SHELL_NAMES.iter().map(|s| s.to_string()).collect();
+        all.extend(extra.into_iter().map(|s| s.as_ref().to_string()));
+        Self::new(all)
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Match on argv0 *or* the resolved executable, because a wrapper script's
+    /// argv0 is the wrapper while its `exe` is the interpreter.
+    pub fn matches(&self, argv: &[String], exe: Option<&Path>) -> bool {
+        let from_argv = argv.first().map(|a| normalize_shell_name(a));
+        let from_exe = exe.map(|p| normalize_shell_name(&p.to_string_lossy()));
+        [from_argv, from_exe]
+            .into_iter()
+            .flatten()
+            .any(|name| self.names.iter().any(|n| n == &name))
+    }
+}
+
+/// Kill every shell process we recognise.
+///
+/// Signals pids discovered from `/proc` rather than using `pkill -x`, because
+/// `-x` matches `comm`, which the kernel truncates to 15 characters — so
+/// `.quickshell-wrapped` and store-path argv0 binaries never match.
 pub fn kill_quickshell() -> Result<()> {
-    pkill(&["-TERM", "-x", "quickshell|qs"])?;
+    kill_shells(&PathBuf::from(PROC_ROOT), &ShellMatcher::default())
+}
+
+pub fn kill_shells(proc_root: &Path, matcher: &ShellMatcher) -> Result<()> {
+    let pids = matching_pids(proc_root, matcher)?;
+    if pids.is_empty() {
+        return Ok(());
+    }
+    signal(&pids, "-TERM")?;
 
     let deadline = Instant::now() + Duration::from_millis(KILL_WAIT_MS);
     while Instant::now() < deadline {
-        if pgrep(&["-x", "quickshell|qs"])?.is_empty() {
+        if matching_pids(proc_root, matcher)?.is_empty() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(KILL_POLL_MS));
     }
 
-    pkill(&["-KILL", "-x", "quickshell|qs"])?;
-    // `quickshell --no-duplicate` is the default, so a follow-up launch
-    // would silently exit if a prior qs survived SIGKILL. Verify it's gone.
+    let survivors = matching_pids(proc_root, matcher)?;
+    if survivors.is_empty() {
+        return Ok(());
+    }
+    signal(&survivors, "-KILL")?;
+
+    // A surviving SIGKILL means D-state, and quickshell's `--no-duplicate`
+    // default would make the follow-up launch exit silently.
     thread::sleep(Duration::from_millis(KILL_POLL_MS));
-    if !pgrep(&["-x", "quickshell|qs"])?.is_empty() {
+    let survivors = matching_pids(proc_root, matcher)?;
+    if !survivors.is_empty() {
         return Err(anyhow!(
-            "quickshell still running after SIGKILL (possibly D-state)"
+            "shell process(es) {survivors:?} still running after SIGKILL (possibly D-state)"
         ));
     }
     Ok(())
+}
+
+fn signal(pids: &[i32], sig: &str) -> Result<()> {
+    let status = Command::new("kill")
+        .arg(sig)
+        .args(pids.iter().map(|p| p.to_string()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("spawning kill")?;
+    // `kill` exits non-zero if any pid vanished between the scan and the signal;
+    // the caller re-scans, so that race is not an error.
+    let _ = status;
+    Ok(())
+}
+
+/// Pids whose argv0 or executable name matches, scanned from `proc_root`.
+pub fn matching_pids(proc_root: &Path, matcher: &ShellMatcher) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    for pid in proc_pids(proc_root)? {
+        let Some(proc_entry) = read_proc_entry(proc_root, pid)? else {
+            continue;
+        };
+        if matcher.matches(&proc_entry.cmdline, proc_entry.exe.as_deref()) {
+            out.push(pid);
+        }
+    }
+    Ok(out)
 }
 
 pub fn rice_shell_alive(name: &str) -> Result<bool> {
@@ -190,42 +326,83 @@ pub struct QuickshellProc {
     pub cwd: Option<PathBuf>,
 }
 
-pub fn find_running_quickshell() -> Result<Option<QuickshellProc>> {
-    for entry in fs::read_dir("/proc")? {
+/// Where procfs is mounted. Injected in tests so `/proc` shapes can be faked.
+pub const PROC_ROOT: &str = "/proc";
+
+/// One process's identity as read from procfs.
+#[derive(Debug, Clone)]
+struct ProcEntry {
+    cmdline: Vec<String>,
+    cwd: Option<PathBuf>,
+    exe: Option<PathBuf>,
+}
+
+fn proc_pids(proc_root: &Path) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(proc_root) {
+        Ok(e) => e,
+        // No procfs (non-Linux) means no processes to find, not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", proc_root.display())),
+    };
+    for entry in entries {
         let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
-        let Ok(pid) = name.to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        // Skip races (process exited) and other users' entries (hidepid). Any
-        // other error propagates — silently dropping it would mis-record our
-        // own unreadable qs as "nothing was running".
-        let bytes = match fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(b) => b,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                continue;
-            }
-            Err(e) => return Err(anyhow!("reading /proc/{pid}/cmdline: {e}")),
-        };
-        let argv = parse_cmdline(&bytes);
-        if argv.is_empty() {
-            continue;
+        if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() {
+            out.push(pid);
         }
-        let argv0_basename = Path::new(&argv[0])
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if matches!(argv0_basename.as_str(), "quickshell" | "qs") {
-            let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok();
-            return Ok(Some(QuickshellProc { cmdline: argv, cwd }));
+    }
+    Ok(out)
+}
+
+fn read_proc_entry(proc_root: &Path, pid: i32) -> Result<Option<ProcEntry>> {
+    // Skip races (process exited) and other users' entries (hidepid). Any other
+    // error propagates — silently dropping it would mis-record our own
+    // unreadable shell as "nothing was running".
+    let bytes = match fs::read(proc_root.join(pid.to_string()).join("cmdline")) {
+        Ok(b) => b,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(anyhow!("reading cmdline for pid {pid}: {e}")),
+    };
+    let cmdline = parse_cmdline(&bytes);
+    if cmdline.is_empty() {
+        return Ok(None);
+    }
+    let dir = proc_root.join(pid.to_string());
+    Ok(Some(ProcEntry {
+        cmdline,
+        cwd: fs::read_link(dir.join("cwd")).ok(),
+        exe: fs::read_link(dir.join("exe")).ok(),
+    }))
+}
+
+/// The first running shell matching `matcher`, for capture-before-install.
+pub fn find_running_shell(
+    proc_root: &Path,
+    matcher: &ShellMatcher,
+) -> Result<Option<QuickshellProc>> {
+    for pid in proc_pids(proc_root)? {
+        let Some(entry) = read_proc_entry(proc_root, pid)? else {
+            continue;
+        };
+        if matcher.matches(&entry.cmdline, entry.exe.as_deref()) {
+            return Ok(Some(QuickshellProc {
+                cmdline: entry.cmdline,
+                cwd: entry.cwd,
+            }));
         }
     }
     Ok(None)
+}
+
+pub fn find_running_quickshell() -> Result<Option<QuickshellProc>> {
+    find_running_shell(&PathBuf::from(PROC_ROOT), &ShellMatcher::default())
 }
 
 fn pkill(args: &[&str]) -> Result<()> {
@@ -307,6 +484,41 @@ fn hyprland_owns_layers(pids: &[u32]) -> Option<bool> {
 mod tests {
     use super::*;
 
+    /// One process to plant in the fixture procfs: `(pid, argv, exe target)`.
+    type ProcFixture = (i32, Vec<String>, Option<String>);
+
+    /// `proc!(42, ["/bin/x", "-c", "y"], None)` — owned values throughout so the
+    /// fixture never depends on array-to-slice coercion.
+    macro_rules! proc {
+        ($pid:expr, [$($arg:literal),* $(,)?], $exe:expr) => {
+            (
+                $pid,
+                vec![$($arg.to_string()),*],
+                $exe.map(|e: &str| e.to_string()),
+            )
+        };
+    }
+
+    /// Build a fixture procfs with the given processes.
+    fn fixture_proc(procs: Vec<ProcFixture>) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        for (pid, argv, exe) in procs {
+            let dir = t.path().join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            let mut cmdline = Vec::new();
+            for arg in &argv {
+                cmdline.extend_from_slice(arg.as_bytes());
+                cmdline.push(0);
+            }
+            fs::write(dir.join("cmdline"), cmdline).unwrap();
+            if let Some(exe) = exe {
+                // The link target need not exist; read_link is what matters.
+                std::os::unix::fs::symlink(exe, dir.join("exe")).unwrap();
+            }
+        }
+        t
+    }
+
     #[test]
     fn tail_returns_last_n_lines() {
         assert_eq!(tail_lines("1\n2\n3\n4\n5", 2), "4\n5");
@@ -319,8 +531,167 @@ mod tests {
         assert_eq!(parse_cmdline(b"foo\0bar\0"), vec!["foo", "bar"]);
         assert_eq!(parse_cmdline(b"foo\0bar"), vec!["foo", "bar"]);
         assert_eq!(parse_cmdline(b"foo\0\0bar\0"), vec!["foo", "", "bar"]);
-        let lossy = parse_cmdline(b"\xff\0ok\0");
+        let raw: &[u8] = b"\xff\0ok\0";
+        let lossy = parse_cmdline(raw);
         assert!(lossy[0].contains('\u{FFFD}'));
         assert_eq!(lossy[1], "ok");
+    }
+
+    // ── shell identity ───────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_unwraps_store_paths_and_nix_wrappers() {
+        assert_eq!(normalize_shell_name("qs"), "qs");
+        assert_eq!(normalize_shell_name("/usr/bin/quickshell"), "quickshell");
+        assert_eq!(
+            normalize_shell_name("/nix/store/abc-quickshell-1.2/bin/quickshell"),
+            "quickshell"
+        );
+        // `wrapProgram` produces a dot-prefixed `-wrapped` sibling.
+        assert_eq!(
+            normalize_shell_name("/nix/store/abc/bin/.quickshell-wrapped"),
+            "quickshell"
+        );
+        assert_eq!(normalize_shell_name("/nix/store/x/bin/.noctalia-wrapped"), "noctalia");
+        // A leading dot with no -wrapped suffix still loses the dot.
+        assert_eq!(normalize_shell_name(".hidden"), "hidden");
+        assert_eq!(normalize_shell_name(""), "");
+    }
+
+    #[test]
+    fn default_matcher_recognises_noctalia() {
+        // The regression: boreal's shell is `noctalia`, so matching only
+        // `quickshell|qs` left it uncaptured, un-evicted and un-replayed.
+        let matcher = ShellMatcher::default();
+        assert!(matcher.matches(&["noctalia".to_string()], None));
+        assert!(matcher.matches(&["/nix/store/x/bin/noctalia".to_string()], None));
+        assert!(matcher.matches(&["quickshell".to_string()], None));
+        assert!(matcher.matches(&["qs".to_string()], None));
+        assert!(matcher.matches(&["noctalia-qs".to_string()], None));
+    }
+
+    #[test]
+    fn unrelated_processes_do_not_match() {
+        let matcher = ShellMatcher::default();
+        for argv0 in ["waybar", "electron", "kitty", "notnoctalia"] {
+            assert!(
+                !matcher.matches(&[argv0.to_string()], None),
+                "matched {argv0}"
+            );
+        }
+    }
+
+    #[test]
+    fn matcher_falls_back_to_the_resolved_executable() {
+        // A wrapper script's argv0 is the wrapper while its exe is the
+        // interpreter, and vice versa; either side may carry the name.
+        let matcher = ShellMatcher::default();
+        assert!(matcher.matches(
+            &["/bin/sh".to_string()],
+            Some(Path::new("/nix/store/x/bin/.noctalia-wrapped"))
+        ));
+        assert!(!matcher.matches(
+            &["/bin/sh".to_string()],
+            Some(Path::new("/usr/bin/bash"))
+        ));
+    }
+
+    #[test]
+    fn new_normalises_and_de_duplicates() {
+        let matcher = ShellMatcher::new(["noctalia", "/usr/bin/noctalia", "./noctalia"]);
+        assert_eq!(matcher.names(), &["noctalia".to_string()]);
+    }
+
+    #[test]
+    fn with_extra_keeps_the_defaults() {
+        let matcher = ShellMatcher::with_extra(["amane"]);
+        assert!(matcher.names().contains(&"amane".to_string()));
+        assert!(matcher.names().contains(&"noctalia".to_string()));
+        assert!(matcher.names().contains(&"quickshell".to_string()));
+    }
+
+    #[test]
+    fn empty_names_are_dropped() {
+        assert!(ShellMatcher::new(["", "   "]).names().is_empty());
+    }
+
+    // ── procfs scanning ──────────────────────────────────────────────────────
+
+    #[test]
+    fn matching_pids_finds_a_noctalia_process() {
+        let proc = fixture_proc(vec![
+            proc!(1, ["/usr/lib/systemd/systemd"], None),
+            proc!(42, ["/nix/store/x/bin/noctalia"], None),
+            proc!(43, ["waybar"], None),
+        ]);
+        assert_eq!(
+            matching_pids(proc.path(), &ShellMatcher::default()).unwrap(),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn matching_pids_finds_a_wrapped_shell_by_exe() {
+        // pid 7: the wrapper itself is argv0.
+        // pid 8: argv0 is a friendlier shim, so only the resolved exe names the
+        // real shell. Both shapes have to be caught.
+        let proc = fixture_proc(vec![
+            proc!(7, ["/nix/store/y/bin/.quickshell-wrapped"], None),
+            proc!(
+                8,
+                ["/home/u/.local/bin/rice-shell"],
+                Some("/nix/store/z/bin/.noctalia-wrapped")
+            ),
+            proc!(9, ["/home/u/.local/bin/unrelated"], Some("/usr/bin/bash")),
+        ]);
+        let pids = matching_pids(proc.path(), &ShellMatcher::default()).unwrap();
+        assert_eq!(pids, vec![7, 8], "pid 9 must not match");
+    }
+
+    #[test]
+    fn missing_proc_root_is_empty_not_an_error() {
+        let matcher = ShellMatcher::default();
+        let missing = Path::new("/nonexistent-proc-root-for-test");
+        assert!(matching_pids(missing, &matcher).unwrap().is_empty());
+        assert!(find_running_shell(missing, &matcher).unwrap().is_none());
+    }
+
+    #[test]
+    fn kill_shells_is_a_no_op_when_nothing_matches() {
+        let proc = fixture_proc(vec![proc!(1, ["waybar"], None)]);
+        // Must not invoke `kill` at all, and must report success.
+        assert!(kill_shells(proc.path(), &ShellMatcher::default()).is_ok());
+    }
+
+    #[test]
+    fn find_running_shell_returns_the_first_match_with_cwd() {
+        let proc = fixture_proc(vec![
+            proc!(5, ["waybar"], None),
+            proc!(6, ["qs", "-c", "clock"], None),
+        ]);
+        let found = find_running_shell(proc.path(), &ShellMatcher::default())
+            .unwrap()
+            .expect("qs should be found");
+        assert_eq!(found.cmdline, vec!["qs", "-c", "clock"]);
+        assert!(found.cwd.is_none(), "fixture has no cwd link");
+    }
+
+    #[test]
+    fn entries_without_cmdline_are_skipped() {
+        let t = tempfile::tempdir().unwrap();
+        // A pid directory with no cmdline: a kernel thread or a race.
+        fs::create_dir_all(t.path().join("9")).unwrap();
+        assert!(matching_pids(t.path(), &ShellMatcher::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn non_numeric_proc_entries_are_ignored() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("self")).unwrap();
+        assert!(matching_pids(t.path(), &ShellMatcher::default())
+            .unwrap()
+            .is_empty());
     }
 }

@@ -75,8 +75,18 @@ impl Paths {
         validate_name(name)?;
         Ok(self.rices_dir().join(name))
     }
+    /// Where the rice's shell writes stdout/stderr.
     pub fn last_run_log(&self) -> PathBuf {
         self.cache_home.join("last-run.log")
+    }
+
+    /// Where the *restored* shell writes when a rice is reverted.
+    ///
+    /// Deliberately not `last_run_log`: the revert runs after a failure, and
+    /// sharing the file meant the restored shell overwrote the failed rice's
+    /// output — destroying the only evidence of why it failed.
+    pub fn last_replay_log(&self) -> PathBuf {
+        self.cache_home.join("last-replay.log")
     }
 
     pub fn installs_dir(&self) -> PathBuf {
@@ -369,6 +379,22 @@ mod tests {
         let (_t, p) = tmp_paths();
         assert!(p.find_catalog().is_none());
         assert!(p.searched_catalog_paths().is_empty());
+    }
+
+    #[test]
+    fn replay_writes_somewhere_else_than_the_rice() {
+        let p = Paths::at_roots(
+            PathBuf::from("/h"),
+            PathBuf::from("/c"),
+            PathBuf::from("/d"),
+        );
+        assert_eq!(p.last_run_log(), PathBuf::from("/c/last-run.log"));
+        assert_eq!(p.last_replay_log(), PathBuf::from("/c/last-replay.log"));
+        assert_ne!(
+            p.last_run_log(),
+            p.last_replay_log(),
+            "sharing these erases the failed rice's log on every revert"
+        );
     }
 
     #[test]

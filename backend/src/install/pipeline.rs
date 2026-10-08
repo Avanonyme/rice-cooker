@@ -693,7 +693,9 @@ fn replay_original_shell<W: Write>(paths: &Paths, events: &mut EventWriter<W>) -
             .as_deref()
             .map(Path::new)
             .unwrap_or_else(|| Path::new("/"));
-        let log = paths.last_run_log();
+        // Its own log: this runs after a failure, and the rice's output is the
+        // evidence we still need.
+        let log = paths.last_replay_log();
         match process::launch_argv(&shell.argv, cwd, &log) {
             Ok(()) => {
                 step(events, Step::Replay, StepState::Done)?;

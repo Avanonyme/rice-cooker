@@ -1,0 +1,92 @@
+.wrap {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-height: 100%;
+  padding: 16px;
+  border: 1px solid var(--c-card-border);
+  border-radius: 14px;
+  /* The app is a transparent desktop overlay, so a code panel needs its own
+     background to stay legible against whatever is behind it. */
+  background: rgba(16, 16, 18, 0.94);
+  color: var(--color-pill-text);
+  font-family: var(--font-display);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.title {
+  color: var(--c-accent);
+  font-size: 1rem;
+}
+
+.close {
+  padding: 2px 8px;
+  border: 1px solid var(--c-card-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--c-preview-meta);
+  font-family: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.note {
+  margin: 0;
+  color: var(--c-preview-meta);
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.code {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid var(--c-card-border);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.4);
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  white-space: pre;
+  cursor: pointer;
+  user-select: text;
+}
+
+.footer {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.7rem;
+  color: var(--c-preview-meta);
+}
+
+.path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.copied[data-copied='true'] {
+  color: var(--c-accent);
+}

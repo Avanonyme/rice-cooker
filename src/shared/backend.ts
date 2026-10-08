@@ -14,9 +14,24 @@ export interface BackendRunRequest {
   name?: string;
 }
 
+/**
+ * The configuration an `install` produced.
+ *
+ * On a declarative platform install cannot mutate the system, so the config *is*
+ * the result — the UI has to show it rather than implying the shell was installed.
+ */
+export interface InstallConfig {
+  /** Language of `text`, and so how to render it. */
+  format: 'nix';
+  text: string;
+  /** Where the backend also wrote it, if it did. */
+  path?: string;
+}
+
 export type BackendEvent =
   | { type: 'hello'; version: number; subcommand: string }
   | { type: 'step'; step: string; state: 'start' | 'done' }
+  | ({ type: 'config' } & InstallConfig)
   | { type: 'success'; active?: string }
   | { type: 'fail'; stage: string; reason: string; log_tail?: string; plugins?: string[] };
 

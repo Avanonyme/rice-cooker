@@ -11,7 +11,13 @@ import {
   type PreviewOption,
   type View,
 } from './view';
-import type { BackendRunRequest, EnvironmentCheckResult, RiceListRow } from '@/shared/backend';
+import type {
+  BackendEvent,
+  BackendRunRequest,
+  EnvironmentCheckResult,
+  InstallConfig,
+  RiceListRow,
+} from '@/shared/backend';
 import { GreenTab } from './components/GreenTab';
 import { RiceCard } from './components/RiceCard';
 import { ScreenContent } from './components/ScreenContent';
@@ -19,6 +25,7 @@ import { PreviewContent } from './components/PreviewContent';
 import { PreviewInstallIntro, PREVIEW_INSTALL_INTRO_MS } from './components/PreviewInstallIntro';
 import { InstallSuccessOverlay, INSTALL_SUCCESS_MS } from './components/InstallSuccessOverlay';
 import { FailureOverlay, FAILURE_OVERLAY_MS } from './components/FailureOverlay';
+import { ConfigPanel } from './components/ConfigPanel';
 import { ClosePin } from './components/ClosePin';
 import { SoundButton } from './components/SoundButton';
 import { ThemeKnob } from './components/ThemeKnob';
@@ -79,6 +86,9 @@ export function PickARice() {
   const failureTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const [installIntroActive, setInstallIntroActive] = useState(false);
   const [installSuccessActive, setInstallSuccessActive] = useState(false);
+  // Set when an install yields configuration instead of a running shell, which is
+  // what every install does on a declarative platform.
+  const [installConfig, setInstallConfig] = useState<InstallConfig | null>(null);
   const [failureActive, setFailureActive] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [pickerExiting, setPickerExiting] = useState(false);
@@ -227,6 +237,8 @@ export function PickARice() {
     playRiceSound(sound);
   }, [rices.length]);
 
+  const configPanelOpen = installConfig !== null;
+
   const finishDownload = useCallback((complete: boolean) => {
     if (launchFallbackRef.current !== null) {
       window.clearTimeout(launchFallbackRef.current);
@@ -254,10 +266,19 @@ export function PickARice() {
     if (backendRunningRef.current) return;
     backendRunningRef.current = true;
     setBackendRunning(true);
+    setInstallConfig(null);
     try {
       const result = await window.rice.backend.run(request);
       if (result.ok) {
         afterSuccess?.();
+        // The config *is* the install result here, so show it rather than letting
+        // the success overlay imply a shell was installed.
+        const config = result.events.find(
+          (event): event is Extract<BackendEvent, { type: 'config' }> => event.type === 'config',
+        );
+        setInstallConfig(
+          config ? { format: config.format, text: config.text, path: config.path } : null,
+        );
       } else {
         if (downloadActiveRef.current) finishDownload(false);
         showFailure();
@@ -384,6 +405,12 @@ export function PickARice() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
+      // The config panel owns Escape while it is open: its text has to survive
+      // being read, so nothing may dismiss it incidentally.
+      if (configPanelOpen) {
+        setInstallConfig(null);
+        return;
+      }
       if (bootOpen) return;
       if (menuOpen) {
         closeMenu();
@@ -405,7 +432,16 @@ export function PickARice() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [bootOpen, closeMenu, failureActive, installSuccessActive, menuOpen, pickerTransitioning, view]);
+  }, [
+    bootOpen,
+    closeMenu,
+    configPanelOpen,
+    failureActive,
+    installSuccessActive,
+    menuOpen,
+    pickerTransitioning,
+    view,
+  ]);
 
   useEffect(() => {
     if (!pickerEntering || menuOpen) return;
@@ -567,7 +603,9 @@ export function PickARice() {
                   <>
                     <div
                       className={`${styles.pickerContent} ${
-                        pickerTransitioning || installSuccessActive || failureActive ? styles.pickerContentHidden : ''
+                        pickerTransitioning || installSuccessActive || failureActive || configPanelOpen
+                          ? styles.pickerContentHidden
+                          : ''
                       }`}
                     >
                       <ScreenContent
@@ -590,8 +628,14 @@ export function PickARice() {
                       )}
                       <ClosingCircles active={view === 'downloading'} riceName={selectedRice?.name} />
                     </div>
-                    {installSuccessActive && <InstallSuccessOverlay />}
+                    {installSuccessActive && !configPanelOpen && <InstallSuccessOverlay />}
                     {failureActive && <FailureOverlay />}
+                    {installConfig && (
+                      <ConfigPanel
+                        config={installConfig}
+                        onDismiss={() => setInstallConfig(null)}
+                      />
+                    )}
                   </>
                 )}
               </RiceCard>

@@ -90,12 +90,14 @@ let
     else
       null;
 
-  # The rice's own enable option, when the catalog names one. Used to verify the
-  # user imported the rice's module and switched it on.
-  hmOption = if entry == null then null else lib.attrByPath [ "nix" "hm_option" ] null entry;
-  hmOptionPath = if hmOption == null then null else lib.splitString "." hmOption;
-  hasRiceOption = hmOptionPath != null && lib.hasAttrByPath hmOptionPath options;
-  riceOptionEnabled = hasRiceOption && lib.getAttrFromPath hmOptionPath config;
+  # The option namespace the rice owns, e.g. `programs.noctalia`. `enable` is the
+  # convention, so it is filled here rather than spelled out in the catalog where
+  # it could drift from the namespace.
+  hmNamespace = if entry == null then null else lib.attrByPath [ "nix" "hm_namespace" ] null entry;
+  hmEnablePath =
+    if hmNamespace == null then null else lib.splitString "." hmNamespace ++ [ "enable" ];
+  hasRiceOption = hmEnablePath != null && lib.hasAttrByPath hmEnablePath options;
+  riceOptionEnabled = hasRiceOption && lib.getAttrFromPath hmEnablePath config;
 
   # Mirrors the backend's argv derivation: a bare binary name resolves against
   # the rice's own package, so a shell's wrapper (which carries its own config
@@ -237,14 +239,14 @@ in
         {
           # `enable = true` next to a rice whose module was never imported would
           # start a shell that nothing configured.
-          assertion = cfg.shell == null || hmOptionPath == null || riceOptionEnabled;
+          assertion = cfg.shell == null || hmEnablePath == null || riceOptionEnabled;
           message = ''
             programs.rice-cooker: shell = "${toString cfg.shell}" is forced, but
-            ${toString hmOption} is not enabled, so the rice's own module was
-            never imported or never switched on. Add both:
+            ${toString hmNamespace}.enable is not enabled, so the rice's own
+            module was never imported or never switched on. Add both:
 
               imports = [ inputs.${toString cfg.shell}.homeManagerModules.default ];
-              ${toString hmOption} = true;
+              ${toString hmNamespace}.enable = true;
 
             A module cannot choose its imports from configuration values, so this
             has to be done by you rather than by programs.rice-cooker.

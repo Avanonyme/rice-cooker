@@ -327,29 +327,115 @@ fn resolve_against_store(mut argv: Vec<String>, store: &Path) -> Vec<String> {
     argv
 }
 
+/// Which compositor's modules to import, when that can be known.
+///
+/// `RICE_COOKER_COMPOSITOR` — written by `programs.rice-cooker` — wins, so a
+/// declarative choice is honoured. Otherwise detection is used, and a headless
+/// install simply emits the compositor-independent modules.
+pub fn compositor_hint() -> Option<crate::compositor::CompositorId> {
+    let env = crate::compositor::SessionEnv::from_process();
+    if let Some(raw) = env.compositor_override.as_deref() {
+        return match raw.trim().to_ascii_lowercase().as_str() {
+            "niri" => Some(crate::compositor::CompositorId::Niri),
+            "hyprland" => Some(crate::compositor::CompositorId::Hyprland),
+            _ => None,
+        };
+    }
+    crate::compositor::Compositor::detect(&env)
+        .ok()
+        .map(|compositor| compositor.id())
+}
+
 /// The config a user adopts for a durable install.
 ///
 /// On Nix, "install" is necessarily an act of configuration — the tool cannot
-/// mutate a declarative system — so the install artifact is this snippet, and
-/// the only durable state rice-cooker keeps is the path it wrote it to.
-pub fn install_snippet(name: &str) -> String {
-    format!(
+/// mutate a declarative system — so the install artifact is this snippet, and the
+/// only durable state rice-cooker keeps is the path it wrote it to.
+///
+/// The compositor matters here: a rice may need an extra module on niri (dms's
+/// `homeModules.niri` extends its own namespace), and that is known at this point
+/// without any rebuild.
+pub fn install_snippet(
+    entry: &RiceEntry,
+    name: &str,
+    compositor: Option<crate::compositor::CompositorId>,
+) -> Result<String> {
+    let nix = entry
+        .nix
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{name}: no [nix] block, so there is nothing to emit"))?;
+
+    let mut out = String::from(
         "# rice-cooker: adopt this into your Home Manager configuration.\n\
          #\n\
-         # `enable` is what forces this shell over whatever your own config\n\
-         # already starts, and `shell` selects from the flake's built-in list.\n\
-         #\n\
-         # The rice's module has to be imported by you: a module cannot choose its\n\
-         # imports from configuration values, and `programs.rice-cooker` asserts\n\
-         # that the option below exists rather than importing it for you.\n\
-         imports = [ inputs.{name}.homeManagerModules.default ];\n\
-         \n\
-         programs.rice-cooker = {{\n\
+         # `enable` is what forces this shell over whatever your own config already\n\
+         # starts, and `shell` selects from the flake's built-in list.\n",
+    );
+
+    let modules = nix.modules(compositor);
+    if !modules.is_empty() {
+        out.push_str(
+            "#\n\
+             # The rice's module has to be imported by you: a module cannot choose its\n\
+             # imports from configuration values, and `programs.rice-cooker` asserts\n\
+             # that the namespace below is enabled rather than importing it for you.\n\
+             imports = [\n",
+        );
+        for module in &modules {
+            out.push_str(&format!("  inputs.{name}.{module}\n"));
+        }
+        out.push_str("];\n\n");
+    }
+
+    out.push_str(&format!(
+        "programs.rice-cooker = {{\n\
          \x20 enable = true;\n\
          \x20 shell = \"{name}\";\n\
          \x20 rices.{name} = inputs.{name};\n\
          }};\n"
-    )
+    ));
+
+    if let Some(namespace) = nix.hm_namespace.as_deref() {
+        // The namespace, plus the conventional `enable`. `hm_config` is merged
+        // beneath the same namespace, so the two cannot disagree.
+        out.push_str(&format!("\n{namespace}.enable = true;\n"));
+        if let Some(settings) = &nix.hm_config {
+            for (key, value) in settings {
+                out.push_str(&format!(
+                    "{namespace}.{key} = {};\n",
+                    toml_to_nix(value)
+                ));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Render a TOML value as a Nix literal.
+///
+/// Only through this function does catalog data reach the snippet, and only
+/// scalars, arrays and tables are representable — never a string that is
+/// interpolated as Nix *syntax*.
+fn toml_to_nix(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => format!("{:?}", s),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(d) => format!("{:?}", d.to_string()),
+        toml::Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(toml_to_nix).collect();
+            format!("[ {} ]", inner.join(" "))
+        }
+        toml::Value::Table(table) => {
+            let inner: Vec<String> = table
+                .iter()
+                .map(|(k, v)| format!("{k} = {};", toml_to_nix(v)))
+                .collect();
+            format!("{{ {} }}", inner.join(" "))
+        }
+    }
 }
 
 /// Remove an emitted snippet. Idempotent: a missing file is success, so revert
@@ -363,12 +449,17 @@ pub fn remove_install_snippet(path: &Path) -> Result<()> {
 }
 
 /// Write the install snippet, returning where it landed.
-pub fn write_install_snippet(paths: &Paths, name: &str) -> Result<PathBuf> {
+pub fn write_install_snippet(
+    paths: &Paths,
+    entry: &RiceEntry,
+    name: &str,
+    compositor: Option<crate::compositor::CompositorId>,
+) -> Result<PathBuf> {
     let dir = paths.data_home.join("install-snippets");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("{name}.nix"));
-    std::fs::write(&path, install_snippet(name))
-        .with_context(|| format!("writing {}", path.display()))?;
+    let body = install_snippet(entry, name, compositor)?;
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
 
@@ -539,16 +630,66 @@ mod tests {
         );
     }
 
+    fn nix_entry(build: &str, module: &str, namespace: Option<&str>) -> RiceEntry {
+        let mut entry = entry_with_launch(None);
+        entry.nix = Some(crate::catalog::NixDecl {
+            build: Some(build.to_string()),
+            flake: None,
+            module: Some(module.to_string()),
+            module_niri: None,
+            hm_namespace: namespace.map(str::to_string),
+            hm_config: None,
+            packages: vec![],
+            follows_nixpkgs: false,
+            mutable_config: false,
+            preview: None,
+            system_module: None,
+            system_module_required: false,
+        });
+        entry
+    }
+
     #[test]
     fn install_snippet_is_adoptable_as_is() {
-        let snippet = install_snippet("niri-caelestia");
+        let entry = nix_entry("default", "homeModules.default", Some("programs.caelestia"));
+        let snippet = install_snippet(&entry, "niri-caelestia", None).unwrap();
         assert!(snippet.contains("programs.rice-cooker"));
         assert!(snippet.contains("enable = true"));
         assert!(snippet.contains("shell = \"niri-caelestia\""));
-        // Without this line the module's own assertion would fail on the snippet
-        // it just told the user to paste.
+        // Without these the module's own assertion would fail on the snippet it
+        // just told the user to paste.
         assert!(snippet.contains("rices.niri-caelestia = inputs.niri-caelestia"));
-        assert!(snippet.contains("inputs.niri-caelestia.homeManagerModules.default"));
+        assert!(snippet.contains("inputs.niri-caelestia.homeModules.default"));
+        // The namespace plus the conventional enable, not a hardcoded option path.
+        assert!(snippet.contains("programs.caelestia.enable = true;"));
+    }
+
+    #[test]
+    fn install_snippet_selects_the_niri_module_only_on_niri() {
+        let mut entry = nix_entry("default", "homeModules.default", Some("programs.dms"));
+        entry.nix.as_mut().unwrap().module_niri = Some("homeModules.niri".to_string());
+        entry.nix.as_mut().unwrap().hm_config = Some(
+            "bar = \"top\"\n"
+                .parse::<toml::Table>()
+                .unwrap(),
+        );
+
+        let on_hypr = install_snippet(&entry, "dms", Some(crate::compositor::CompositorId::Hyprland)).unwrap();
+        assert!(!on_hypr.contains("homeModules.niri"), "{on_hypr}");
+
+        let on_niri = install_snippet(&entry, "dms", Some(crate::compositor::CompositorId::Niri)).unwrap();
+        assert!(on_niri.contains("inputs.dms.homeModules.niri"), "{on_niri}");
+        // hm_config is nested under the namespace, not repeated with it.
+        assert!(on_niri.contains("programs.dms.bar = \"top\";"), "{on_niri}");
+        assert!(!on_niri.contains("programs.dms.programs"), "{on_niri}");
+    }
+
+    #[test]
+    fn install_snippet_without_a_namespace_omits_the_enable_line() {
+        let entry = nix_entry("default", "homeModules.default", None);
+        let snippet = install_snippet(&entry, "x", None).unwrap();
+        assert!(snippet.contains("programs.rice-cooker"));
+        assert!(!snippet.contains(".enable = true;\n\nprograms"), "{snippet}");
     }
 
     #[test]
@@ -556,8 +697,9 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let home = t.path().to_path_buf();
         let paths = Paths::at_roots(home.clone(), home.join("cache"), home.join("data"));
-        let first = write_install_snippet(&paths, "dms").unwrap();
-        let second = write_install_snippet(&paths, "dms").unwrap();
+        let entry = nix_entry("default", "homeModules.default", None);
+        let first = write_install_snippet(&paths, &entry, "dms", None).unwrap();
+        let second = write_install_snippet(&paths, &entry, "dms", None).unwrap();
         assert_eq!(first, second);
         assert!(first.starts_with(home.join("data")));
         assert!(std::fs::read_to_string(&first).unwrap().contains("dms"));
@@ -606,11 +748,38 @@ mod tests {
     }
 
     #[test]
+    fn the_bundled_dms_entry_emits_its_niri_module_only_on_niri() {
+        // A cross-check of the whole chain: catalog data, the compositor, and the
+        // snippet the user is told to paste.
+        let catalog = crate::catalog::Catalog::parse(include_str!("../catalog.toml")).unwrap();
+        let entry = catalog.get("dms").expect("dms is in the bundled catalog");
+
+        let on_niri = install_snippet(entry, "dms", Some(crate::compositor::CompositorId::Niri))
+            .unwrap();
+        assert!(
+            on_niri.contains("inputs.dms.homeModules.niri"),
+            "the niri module is required on niri:\n{on_niri}"
+        );
+        assert!(
+            on_niri.contains("programs.dank-material-shell.enable = true;"),
+            "the namespace plus the filled enable:\n{on_niri}"
+        );
+
+        let on_hyprland =
+            install_snippet(entry, "dms", Some(crate::compositor::CompositorId::Hyprland)).unwrap();
+        assert!(
+            !on_hyprland.contains("homeModules.niri"),
+            "the niri module must not be imported on Hyprland:\n{on_hyprland}"
+        );
+    }
+
+    #[test]
     fn remove_install_snippet_is_idempotent() {
         let t = tempfile::tempdir().unwrap();
         let home = t.path().to_path_buf();
         let paths = Paths::at_roots(home.clone(), home.join("cache"), home.join("data"));
-        let path = write_install_snippet(&paths, "dms").unwrap();
+        let entry = nix_entry("default", "homeModules.default", None);
+        let path = write_install_snippet(&paths, &entry, "dms", None).unwrap();
         assert!(path.exists());
         remove_install_snippet(&path).unwrap();
         assert!(!path.exists());

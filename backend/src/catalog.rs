@@ -177,15 +177,23 @@ pub struct NixDecl {
     /// independent of `build`: a rice may have either, both, or neither.
     #[serde(default)]
     pub module: Option<String>,
-    /// This rice's own enable option, as a dotted path, e.g.
-    /// `programs.caelestia.enable`.
+    /// An extra module required when the compositor is niri.
     ///
-    /// A module cannot choose its imports from configuration values, so the user
-    /// has to import the rice's module themselves. This lets
-    /// `programs.rice-cooker` *verify* they did, instead of silently forcing a
-    /// shell whose module was never imported.
+    /// Some rices extend their own namespace for niri rather than shipping a
+    /// second one — dms's `homeModules.niri` adds `programs.dank-material-shell.niri.*`
+    /// — so the compositor decides which modules are imported. Known at
+    /// evaluation time, hence no rebuild.
     #[serde(default)]
-    pub hm_option: Option<String>,
+    pub module_niri: Option<String>,
+    /// The option namespace this rice owns, e.g. `programs.noctalia`.
+    ///
+    /// The namespace, not a full option path: `enable` is the convention and is
+    /// filled in, so the catalog never hardcodes `.enable` and cannot drift from
+    /// it. A module cannot choose its imports from configuration values, so the
+    /// user imports the rice's module themselves; this lets
+    /// `programs.rice-cooker` *verify* they did.
+    #[serde(default)]
+    pub hm_namespace: Option<String>,
     /// Extra nixpkgs attribute paths to add to `home.packages`.
     #[serde(default)]
     pub packages: Vec<String>,
@@ -210,8 +218,10 @@ pub struct NixDecl {
     /// incompletely, because applying it requires a system rebuild.
     #[serde(default)]
     pub system_module_required: bool,
-    /// Nix module configuration, as data. Converted to JSON and merged into the
-    /// generated module — never interpolated as Nix source text.
+    /// Settings merged **beneath [`Self::hm_namespace`]**, as data.
+    ///
+    /// Relative, so the catalog stays compact and cannot disagree with the
+    /// namespace. Never interpolated as Nix source text.
     #[serde(default)]
     pub hm_config: Option<toml::Table>,
 }
@@ -253,6 +263,20 @@ impl NixDecl {
             Some(explicit) if !explicit.is_empty() => explicit.to_string(),
             _ => format!("{}", format_args!("{repo}/{commit}")),
         }
+    }
+
+    /// The modules to import, given the compositor we are running on.
+    pub fn modules(&self, compositor: Option<CompositorId>) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        if let Some(module) = self.module.as_deref() {
+            out.push(module);
+        }
+        if compositor == Some(CompositorId::Niri)
+            && let Some(module) = self.module_niri.as_deref()
+        {
+            out.push(module);
+        }
+        out
     }
 
     /// The `packages.<system>` attribute, when the rice has one to build.
@@ -581,6 +605,9 @@ fn validate_nix(name: &str, entry: &RiceEntry) -> Result<()> {
     if let Some(module) = nix.module.as_deref() {
         ensure_attr_path(name, "nix.module", module)?;
     }
+    if let Some(module) = nix.module_niri.as_deref() {
+        ensure_attr_path(name, "nix.module_niri", module)?;
+    }
 
     for package in &nix.packages {
         ensure_attr_path(name, "nix.packages", package)?;
@@ -590,9 +617,14 @@ fn validate_nix(name: &str, entry: &RiceEntry) -> Result<()> {
         ensure_attr_path(name, "nix.system_module", system_module)?;
     }
 
-    if let Some(hm_option) = nix.hm_option.as_deref() {
-        ensure_attr_path(name, "nix.hm_option", hm_option)?;
+    if let Some(namespace) = nix.hm_namespace.as_deref() {
+        ensure_attr_path(name, "nix.hm_namespace", namespace)?;
     }
+    ensure!(
+        !(nix.hm_config.is_some() && nix.hm_namespace.is_none()),
+        "{name}: nix.hm_config is relative to nix.hm_namespace, so the namespace has to be \
+         declared for there to be anything to nest it under"
+    );
 
     ensure!(
         !(nix.system_module_required && nix.system_module.is_none()),
@@ -660,12 +692,13 @@ mod tests {
         [noctalia.nix]
         build = "default"
         module = "homeModules.default"
+        hm_namespace = "programs.noctalia"
         system_module = "nixosModules.default"
         packages = ["cliphist", "wl-clipboard"]
         follows_nixpkgs = true
 
-        [noctalia.nix.hm_config.programs.noctalia]
-        enable = true
+        [noctalia.nix.hm_config]
+        settings = "top"
     "#;
 
     #[test]
@@ -852,7 +885,9 @@ mod tests {
         assert_eq!(nix.packages, vec!["cliphist", "wl-clipboard"]);
         assert_eq!(nix.build_attr(), Some("default"));
         let hm = nix.hm_config.as_ref().unwrap();
-        assert!(hm.contains_key("programs"));
+        // Relative to `hm_namespace`, so the catalog cannot disagree with it.
+        assert!(hm.contains_key("settings"));
+        assert!(!hm.contains_key("programs"), "hm_config must not repeat the namespace");
 
         // A module rice places its own config; the Arch-era symlink fields are
         // not applicable and are rejected (see `module_rice_may_not_declare_symlinks`).
@@ -1158,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn hm_option_is_parsed_and_validated() {
+    fn hm_namespace_is_a_namespace_not_an_option_path() {
         let t = r#"
             [x]
             display_name = "X"
@@ -1167,17 +1202,53 @@ mod tests {
             commit = "0123456789abcdef0123456789abcdef01234567"
             [x.nix]
             build = "default"
-            hm_option = "programs.caelestia.enable"
+            hm_namespace = "programs.noctalia"
+            [x.nix.hm_config.settings]
+            bar = "top"
         "#;
         let c = Catalog::parse(t).unwrap();
-        assert_eq!(
-            c.get("x").unwrap().nix.as_ref().unwrap().hm_option.as_deref(),
-            Some("programs.caelestia.enable")
-        );
+        let nix = c.get("x").unwrap().nix.as_ref().unwrap();
+        assert_eq!(nix.hm_namespace.as_deref(), Some("programs.noctalia"));
+        assert!(nix.hm_config.as_ref().unwrap().contains_key("settings"));
 
-        // An injections-shaped path must be refused like any other attr path.
-        let bad = t.replace("programs.caelestia.enable", r"programs.${evil}");
-        assert!(Catalog::parse(&bad).is_err());
+        // A full option path is still a valid attr path, so the only guard that
+        // matters is that hm_config has a namespace to nest under.
+        let orphan = r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            [x.nix]
+            build = "default"
+            [x.nix.hm_config.settings]
+            bar = "top"
+        "#;
+        let err = Catalog::parse(orphan).unwrap_err().to_string();
+        assert!(err.contains("relative to nix.hm_namespace"), "got: {err}");
+    }
+
+    #[test]
+    fn module_niri_is_selected_by_the_compositor() {
+        let t = r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            [x.nix]
+            build = "default"
+            module = "homeModules.default"
+            module_niri = "homeModules.niri"
+        "#;
+        let c = Catalog::parse(t).unwrap();
+        let nix = c.get("x").unwrap().nix.as_ref().unwrap();
+        assert_eq!(nix.modules(None), vec!["homeModules.default"]);
+        assert_eq!(nix.modules(Some(CompositorId::Hyprland)), vec!["homeModules.default"]);
+        assert_eq!(
+            nix.modules(Some(CompositorId::Niri)),
+            vec!["homeModules.default", "homeModules.niri"]
+        );
     }
 
     #[test]

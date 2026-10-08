@@ -49,7 +49,7 @@
         { shell, compositor }:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          # Stands in for the rice's own module, so the `nix.hm_option`
+          # Stands in for the rice's own module, so the `nix.hm_namespace`
           # assertion can be satisfied without pulling the rice flake in.
           riceStub = { lib, ... }: {
             options.programs.caelestia.enable = lib.mkEnableOption "caelestia";

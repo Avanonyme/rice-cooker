@@ -48,7 +48,7 @@ argv = ["noctalia"]
 # once, which is why `build` and `module` are separate fields.
 build = "default"
 module = "homeModules.default"
-hm_option = "programs.noctalia.enable"
+hm_namespace = "programs.noctalia"
 flake = "github:noctalia-dev/noctalia-shell/3e159ec301f8916e3bfd17c178258fa030f40e39"
 
 [linux-retroism]
@@ -66,6 +66,19 @@ repo = "https://github.com/AvengeMedia/DankMaterialShell"
 commit = "c6ed64b24e414cd4b9588b645a6345b15fa697f4"
 symlink_src = "quickshell"
 symlink_dst = "~/.config/quickshell/dms"
+# The flake ships homeModules.niri and the tree references niri 31 times.
+compositors = ["hyprland", "niri"]
+# layer_namespaces left unset: it is a quickshell rice, so the `^quickshell`
+# default applies on niri until it is measured live.
+
+[dms.nix]
+build = "default"
+module = "homeModules.default"
+# dms extends its *own* namespace for niri rather than shipping a second one, so
+# the compositor decides which modules are imported — known at evaluation time.
+module_niri = "homeModules.niri"
+hm_namespace = "programs.dank-material-shell"
+flake = "github:AvengeMedia/DankMaterialShell/c6ed64b24e414cd4b9588b645a6345b15fa697f4"
 
 [zephyr]
 display_name = "Zephyr"
@@ -79,11 +92,22 @@ symlink_dst = "~/.config/quickshell/zephyr"
 display_name = "Caelestia"
 creator_name = "soramenew"
 repo = "https://github.com/caelestia-dots/shell"
-commit = "stable"
+# Was the branch `stable`, which floats: the same catalog produced different rices
+# over time. Pinned to that branch's tip at the time of writing.
+commit = "d999d4878ee4cec134168e60d913714566a8cfa6"
 symlink_src = "."
 symlink_dst = "~/.config/quickshell/caelestia"
 package_managed = true
 preview_deps = ["quickshell-git", "caelestia-shell"]
+# Hyprland-only: the tree contains zero niri references.
+compositors = ["hyprland"]
+layer_namespaces = ["^caelestia-"]
+
+[caelestia.nix]
+build = "default"
+module = "homeModules.default"
+hm_namespace = "programs.caelestia"
+flake = "github:caelestia-dots/shell/d999d4878ee4cec134168e60d913714566a8cfa6"
 
 [whisker]
 display_name = "whisker"
@@ -102,14 +126,8 @@ install_deps = [
 ]
 preview_deps = ["ttf-material-symbols-variable", "ttf-outfit"]
 
-[ryu-shell]
-display_name = "Ryu Shell"
-creator_name = "RyuZinOh"
-repo = "https://github.com/RyuZinOh/.dotfiles"
-commit = "9380b0232e69a847459c35d0e7c417dead0cb3be"
-symlink_src = "quickshell"
-symlink_dst = "~/.config/quickshell/ryu-shell"
-preview_deps = ["ttf-cascadia-code-nerd", "noto-fonts-cjk"]
+# ryu-shell was removed: github.com/RyuZinOh/.dotfiles returns 404, so the entry
+# could never install. It can come back if the repository does.
 
 [nandoroid]
 display_name = "Nandoroid"
@@ -148,4 +166,4 @@ build = "default"
 module = "homeModules.default"
 flake = "github:jutraim/niri-caelestia-shell/fe36491a77c56ac51d6cad1c6fc05f9828fad837"
 # So `programs.rice-cooker` can verify the user imported the rice's module.
-hm_option = "programs.caelestia.enable"
+hm_namespace = "programs.caelestia"

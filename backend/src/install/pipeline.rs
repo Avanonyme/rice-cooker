@@ -302,7 +302,7 @@ fn run_activate<W: Write>(
                 let snippet = try_stage!(
                     events,
                     "record",
-                    platform::write_install_snippet(paths, name)
+                    platform::write_install_snippet(paths, entry, name, platform::compositor_hint())
                 );
                 step(events, Step::Record, StepState::Start)?;
                 try_stage!(
@@ -430,7 +430,7 @@ fn run_activate<W: Write>(
             Some(try_stage!(
                 events,
                 "record",
-                platform::write_install_snippet(paths, name)
+                platform::write_install_snippet(paths, entry, name, platform::compositor_hint())
             ))
         } else {
             None
@@ -1125,7 +1125,7 @@ fn emit_install_config<W: Write>(
     let snippet = try_stage!(
         events,
         "record",
-        platform::write_install_snippet(paths, name)
+        platform::write_install_snippet(paths, entry, name, platform::compositor_hint())
     );
     let text = match fs::read_to_string(&snippet) {
         Ok(text) => text,

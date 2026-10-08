@@ -135,8 +135,13 @@ function backendBaseArgs(): string[] {
 }
 
 function appIconPath(): string {
+  // `electron <app-dir>` leaves isPackaged false, so the packaged branch is not
+  // taken even when the icon is installed beside the app. Check the app dir
+  // first: that is where the Nix package puts it.
+  const besideApp = join(app.getAppPath(), APP_ICON_FILE);
+  if (existsSync(besideApp)) return besideApp;
   return app.isPackaged
-    ? join(app.getAppPath(), APP_ICON_FILE)
+    ? besideApp
     : join(process.cwd(), 'packaging/icons', APP_ICON_FILE);
 }
 

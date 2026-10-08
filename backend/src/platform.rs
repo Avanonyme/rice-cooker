@@ -9,8 +9,9 @@
 //!    the launch argv from the catalog, and emitting the two-line module snippet
 //!    that is what "install" means on a declarative system.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -174,7 +175,10 @@ pub fn build_store_path(flake_ref: &str, package_attr: &str) -> Result<PathBuf> 
     let target = format!("{flake_ref}#{package_attr}");
     eprintln!("build_store_path: nix build {target}");
 
-    let out = Command::new("nix")
+    // stderr is inherited, not captured: nix's progress bar and build logs are
+    // the only feedback during a multi-minute compile, and `output()` would
+    // swallow them so a compiling quickshell looks like a hang.
+    let mut child = Command::new("nix")
         .args([
             "build",
             "--no-link",
@@ -182,19 +186,22 @@ pub fn build_store_path(flake_ref: &str, package_attr: &str) -> Result<PathBuf> 
             "--no-write-lock-file",
         ])
         .arg(&target)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
         .context("spawning nix build")?;
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!(
-            "nix build {target} failed (exit {:?}):\n{}",
-            out.status.code(),
-            tail(&stderr, 40)
-        );
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)
+            .context("reading nix build stdout")?;
+    }
+    let status = child.wait().context("waiting for nix build")?;
+    if !status.success() {
+        bail!("nix build {target} failed (exit {:?})", status.code());
     }
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = stdout.as_str();
     let path = stdout
         .lines()
         .map(str::trim)
@@ -287,12 +294,6 @@ pub fn write_install_snippet(paths: &Paths, name: &str) -> Result<PathBuf> {
     std::fs::write(&path, install_snippet(name))
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
-}
-
-fn tail(text: &str, lines: usize) -> String {
-    let all: Vec<&str> = text.lines().collect();
-    let start = all.len().saturating_sub(lines);
-    all[start..].join("\n")
 }
 
 #[cfg(test)]
@@ -494,9 +495,4 @@ mod tests {
         assert!(err.contains("refusing package attribute"), "got: {err}");
     }
 
-    #[test]
-    fn tail_keeps_the_last_lines() {
-        assert_eq!(tail("a\nb\nc\nd", 2), "c\nd");
-        assert_eq!(tail("a", 5), "a");
-    }
 }

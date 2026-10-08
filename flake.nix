@@ -217,6 +217,8 @@
                 install -Dm644 ${./backend/catalog.toml} $out/share/rice-cooker/catalog.toml
 
                 install -Dm644 packaging/icons/rice-cooker.png \
+                  $out/share/rice-cooker/rice-cooker.png
+                install -Dm644 packaging/icons/rice-cooker.png \
                   $out/share/icons/hicolor/512x512/apps/rice-cooker.png
                 install -Dm644 packaging/icons/rice-cooker.svg \
                   $out/share/icons/hicolor/scalable/apps/rice-cooker.svg

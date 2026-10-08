@@ -286,6 +286,16 @@ pub fn install_snippet(name: &str) -> String {
     )
 }
 
+/// Remove an emitted snippet. Idempotent: a missing file is success, so revert
+/// can be retried.
+pub fn remove_install_snippet(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 /// Write the install snippet, returning where it landed.
 pub fn write_install_snippet(paths: &Paths, name: &str) -> Result<PathBuf> {
     let dir = paths.data_home.join("install-snippets");
@@ -485,6 +495,19 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with(home.join("data")));
         assert!(std::fs::read_to_string(&first).unwrap().contains("dms"));
+    }
+
+    #[test]
+    fn remove_install_snippet_is_idempotent() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().to_path_buf();
+        let paths = Paths::at_roots(home.clone(), home.join("cache"), home.join("data"));
+        let path = write_install_snippet(&paths, "dms").unwrap();
+        assert!(path.exists());
+        remove_install_snippet(&path).unwrap();
+        assert!(!path.exists());
+        // Retrying must not fail: revert is allowed to run twice.
+        remove_install_snippet(&path).unwrap();
     }
 
     #[test]

@@ -182,6 +182,7 @@ pub fn kill_quickshell() -> Result<()> {
 /// name, not `quickshell`, so the default matcher alone would leave a previously
 /// previewed shell running and leave two shells fighting for the same surfaces.
 pub fn kill_quickshell_with(extra: &[String]) -> Result<()> {
+    stop_preview_unit();
     kill_shells(
         &PathBuf::from(PROC_ROOT),
         &ShellMatcher::with_extra(extra.iter().cloned()),
@@ -261,7 +262,21 @@ pub fn launch_detached_by_name(name: &str, log_file: &Path, cwd: &Path) -> Resul
     launch_argv(&argv, cwd, log_file)
 }
 
+/// The transient unit a preview runs in, when the user manager is reachable.
+pub const PREVIEW_UNIT: &str = "rice-cooker-preview";
+
 /// Relaunch from a persisted argv+cwd pair, regardless of `-p <path>` vs `-c <name>`.
+///
+/// **Not `setsid`.** `setsid` puts the shell in a new session, so it survives
+/// logout; a stale instance then holds its layer surfaces and
+/// `org.freedesktop.Notifications` into the next login, which presents as a black
+/// screen with no bar and no terminal. A preview must die with the session it
+/// previewed in.
+///
+/// `systemd-run --user` is preferred: a transient unit bound to the user manager
+/// dies with the session, is visible via `systemctl --user status`, and can be
+/// stopped by name. The fallback is a plain spawn that stays in this session —
+/// reparented to init when rice-cooker exits, but still killed at logout.
 pub fn launch_argv(argv: &[String], cwd: &Path, log_file: &Path) -> Result<()> {
     let (argv0, rest) = argv
         .split_first()
@@ -271,10 +286,46 @@ pub fn launch_argv(argv: &[String], cwd: &Path, log_file: &Path) -> Result<()> {
     let log_stdout = log
         .try_clone()
         .with_context(|| format!("cloning log handle {}", log_file.display()))?;
-    // setsid's exit reflects spawn success only — `verify_by_name` checks child health.
-    let status = Command::new("setsid")
-        .arg("-f")
+
+    let log_arg = format!("file:{}", log_file.display());
+    let cwd_arg = format!("WorkingDirectory={}", cwd.display());
+    let unit_arg = format!("--unit={PREVIEW_UNIT}");
+
+    // A stale unit from a previous preview would make systemd-run fail, and the
+    // failure would be indistinguishable from "systemd-run is unavailable".
+    let _ = Command::new("systemctl")
+        .args(["--user", "reset-failed", PREVIEW_UNIT])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let via_systemd = Command::new("systemd-run")
+        .args(["--user", "--collect", &unit_arg])
+        .args(["--property", "Type=exec"])
+        .args(["--property", &cwd_arg])
+        .args(["--property", &format!("StandardOutput={log_arg}")])
+        .args(["--property", &format!("StandardError={log_arg}")])
+        .args(["--setenv", "QT_FORCE_STDERR_LOGGING=1"])
+        .args(["--setenv", "XDG_RUNTIME_DIR"])
+        .arg("--")
         .arg(argv0)
+        .args(rest)
+        .status();
+
+    match via_systemd {
+        Ok(status) if status.success() => return Ok(()),
+        // Present but failed, or absent entirely: fall through rather than
+        // refusing to preview at all. The fallback is still session-bound.
+        Ok(status) => eprintln!(
+            "rice-cooker: systemd-run --user failed (exit {status}); launching in-session instead"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("rice-cooker: systemd-run not found; launching in-session instead");
+        }
+        Err(e) => return Err(anyhow!("spawning systemd-run: {e}")),
+    }
+
+    let status = Command::new(argv0)
         .args(rest)
         .env("QT_FORCE_STDERR_LOGGING", "1")
         .current_dir(cwd)
@@ -282,11 +333,23 @@ pub fn launch_argv(argv: &[String], cwd: &Path, log_file: &Path) -> Result<()> {
         .stdout(log_stdout)
         .stderr(log)
         .status()
-        .with_context(|| format!("spawning setsid {argv0}"))?;
+        .with_context(|| format!("spawning {argv0}"))?;
     if !status.success() {
-        return Err(anyhow!("setsid failed to spawn (exit {status})"));
+        return Err(anyhow!("{argv0} failed to spawn (exit {status})"));
     }
     Ok(())
+}
+
+/// Stop the preview unit, if the user manager owns one.
+///
+/// A preview launched through `systemd-run` is not reliably found by name
+/// matching alone, and stopping it by unit is exact.
+pub fn stop_preview_unit() {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", PREVIEW_UNIT])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 #[derive(Debug, Clone, PartialEq)]

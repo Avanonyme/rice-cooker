@@ -258,6 +258,34 @@ fn run_activate<W: Write>(
             None => try_stage!(events, "deps", deps::missing(selected_deps)).is_empty(),
         };
         if alive && satisfied {
+            // On Nix, `install` must still emit its artifact. Short-circuiting
+            // here reported success for an install that wrote nothing, which is
+            // exactly what a preview-then-install does.
+            if mode == ActivateMode::Install
+                && platform == PlatformId::Nix
+                && record.nix.as_ref().is_some_and(|n| n.snippet_path.is_none())
+                && let Some(nix) = record.nix.as_ref()
+            {
+                let snippet = try_stage!(
+                    events,
+                    "record",
+                    platform::write_install_snippet(paths, name)
+                );
+                step(events, Step::Record, StepState::Start)?;
+                try_stage!(
+                    events,
+                    "record",
+                    do_record_nix(
+                        paths,
+                        name,
+                        entry,
+                        &nix.store_path,
+                        &nix.launch_argv,
+                        Some(snippet)
+                    )
+                );
+                step(events, Step::Record, StepState::Done)?;
+            }
             events.emit(&Event::Success {
                 active: Some(name.to_string()),
             })?;
@@ -588,7 +616,20 @@ fn uninstall_locked<W: Write>(
 
     // A Nix record has no packages to remove and no symlink to drop: the store
     // path is garbage-collected on its own, and undo is simply stopping the
-    // shell, which the KillQuickshell step below already did.
+    // shell, which the KillQuickshell step below already did. The emitted config
+    // snippet, however, is a real file that revert has to take back.
+    if let Some(nix) = &record.nix {
+        if let Some(snippet) = &nix.snippet_path {
+            step(events, Step::Symlink, StepState::Start)?;
+            try_stage!(
+                events,
+                "symlink",
+                "remove_snippet",
+                platform::remove_install_snippet(snippet)
+            );
+            step(events, Step::Symlink, StepState::Done)?;
+        }
+    }
     if record.nix.is_none() {
     // Pre-filter via pacman -Q so retries don't abort on "target not found".
     step(events, Step::Deps, StepState::Start)?;

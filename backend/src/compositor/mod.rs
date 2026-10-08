@@ -91,6 +91,9 @@ pub struct SessionEnv {
     pub hyprland_signature: Option<String>,
     pub niri_socket: Option<String>,
     pub current_desktop: Option<String>,
+    /// Explicit compositor override from `RICE_COOKER_COMPOSITOR` (the Nix
+    /// module writes it). `None` means detect as before.
+    pub compositor_override: Option<String>,
     /// `/proc` on Linux; a fixture directory in tests.
     pub proc_root: PathBuf,
 }
@@ -106,6 +109,7 @@ impl SessionEnv {
             hyprland_signature: non_empty("HYPRLAND_INSTANCE_SIGNATURE"),
             niri_socket: non_empty("NIRI_SOCKET"),
             current_desktop: non_empty("XDG_CURRENT_DESKTOP"),
+            compositor_override: non_empty("RICE_COOKER_COMPOSITOR"),
             proc_root: PathBuf::from("/proc"),
         }
     }
@@ -122,6 +126,10 @@ impl Compositor {
     /// session started from a niri one would inherit `NIRI_SOCKET`, so
     /// signature-before-socket is the safe order.
     pub fn detect(env: &SessionEnv) -> Result<Self> {
+        if let Some(raw) = env.compositor_override.as_deref() {
+            return detect_override(env, raw);
+        }
+
         let hypr_sig = env.hyprland_signature.as_deref();
         if let Some(sig) = hypr_sig
             && hyprland::instance_socket(env, sig).is_some()
@@ -175,6 +183,45 @@ impl Compositor {
             namespaces: declared,
             baseline,
         }
+    }
+}
+
+/// Explicit override from `RICE_COOKER_COMPOSITOR`. Case-insensitive on the
+/// name, and it never falls back to the other compositor: naming a compositor
+/// whose socket is not reachable is an error that names the missing socket.
+fn detect_override(env: &SessionEnv, raw: &str) -> Result<Compositor> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "hyprland" => {
+            let Some(sig) = env.hyprland_signature.as_deref() else {
+                anyhow::bail!(
+                    "RICE_COOKER_COMPOSITOR=hyprland but HYPRLAND_INSTANCE_SIGNATURE is unset; \
+                     expected a live socket at {}/hypr/<signature>/.socket.sock",
+                    env.runtime_dir.display()
+                );
+            };
+            if hyprland::instance_socket(env, sig).is_none() {
+                anyhow::bail!(
+                    "RICE_COOKER_COMPOSITOR=hyprland but the Hyprland instance socket \
+                     {}/hypr/{sig}/.socket.sock is not reachable",
+                    env.runtime_dir.display()
+                );
+            }
+            Ok(Compositor::Hyprland {
+                signature: sig.to_string(),
+            })
+        }
+        "niri" => match niri::resolve_socket(env) {
+            Ok(Some(socket)) => Ok(Compositor::Niri { socket }),
+            Ok(None) => anyhow::bail!(
+                "RICE_COOKER_COMPOSITOR=niri but no niri IPC socket is reachable \
+                 (looked for niri.<WAYLAND_DISPLAY>.<pid>.sock in {})",
+                env.runtime_dir.display()
+            ),
+            Err(e) => anyhow::bail!("RICE_COOKER_COMPOSITOR=niri: {e:#}"),
+        },
+        other => anyhow::bail!(
+            "unknown RICE_COOKER_COMPOSITOR value {other:?}; expected `hyprland` or `niri`"
+        ),
     }
 }
 
@@ -417,5 +464,153 @@ mod tests {
             assert_eq!(back, id);
             assert_eq!(id.as_str(), wire.trim_matches('"'));
         }
+    }
+
+    // ── RICE_COOKER_COMPOSITOR override ──────────────────────────────────────
+
+    fn session_env(
+        root: &std::path::Path,
+        hyprland_signature: Option<&str>,
+        niri_socket: Option<&str>,
+        compositor_override: Option<&str>,
+    ) -> SessionEnv {
+        SessionEnv {
+            runtime_dir: root.to_path_buf(),
+            wayland_display: Some("wayland-1".to_string()),
+            hyprland_signature: hyprland_signature.map(str::to_string),
+            niri_socket: niri_socket.map(str::to_string),
+            current_desktop: None,
+            compositor_override: compositor_override.map(str::to_string),
+            proc_root: root.join("proc"),
+        }
+    }
+
+    fn touch_hyprland_socket(root: &std::path::Path, signature: &str) {
+        let dir = root.join("hypr").join(signature);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".socket.sock"), b"").unwrap();
+    }
+
+    #[test]
+    fn override_niri_is_case_insensitive() {
+        use std::os::unix::net::UnixListener;
+        let t = tempfile::tempdir().unwrap();
+        let sock = t.path().join("niri.wayland-1.7.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+
+        for raw in ["niri", "Niri", "NIRI"] {
+            let env = session_env(
+                t.path(),
+                None,
+                Some(&sock.to_string_lossy()),
+                Some(raw),
+            );
+            assert_eq!(
+                Compositor::detect(&env).unwrap(),
+                Compositor::Niri { socket: sock.clone() }
+            );
+        }
+    }
+
+    #[test]
+    fn override_hyprland_is_case_insensitive_and_uses_the_live_socket() {
+        let t = tempfile::tempdir().unwrap();
+        let sig = "abc123";
+        touch_hyprland_socket(t.path(), sig);
+        let env = session_env(t.path(), Some(sig), None, Some("HyPrLaNd"));
+        assert_eq!(
+            Compositor::detect(&env).unwrap(),
+            Compositor::Hyprland { signature: sig.to_string() }
+        );
+    }
+
+    #[test]
+    fn override_hyprland_missing_socket_names_the_socket() {
+        let t = tempfile::tempdir().unwrap();
+        let sig = "abc123";
+        let env = session_env(t.path(), Some(sig), None, Some("hyprland"));
+        let err = Compositor::detect(&env).unwrap_err().to_string();
+        assert!(err.contains("hyprland"), "got: {err}");
+        assert!(err.contains(".socket.sock"), "got: {err}");
+        assert!(err.contains(sig), "got: {err}");
+    }
+
+    #[test]
+    fn override_niri_does_not_fall_back_to_hyprland() {
+        let t = tempfile::tempdir().unwrap();
+        // A live Hyprland socket is present, so a fallback would succeed; the
+        // override must still fail because it names niri, whose socket is absent.
+        touch_hyprland_socket(t.path(), "sig");
+        let env = session_env(t.path(), Some("sig"), None, Some("niri"));
+        let err = Compositor::detect(&env).unwrap_err().to_string();
+        assert!(err.contains("niri"), "got: {err}");
+        assert!(err.contains("sock"), "got: {err}");
+    }
+
+    #[test]
+    fn override_niri_missing_socket_names_the_socket() {
+        let t = tempfile::tempdir().unwrap();
+        let env = session_env(t.path(), None, None, Some("niri"));
+        let err = Compositor::detect(&env).unwrap_err().to_string();
+        assert!(err.contains("niri"), "got: {err}");
+        assert!(err.contains("sock"), "got: {err}");
+    }
+
+    #[test]
+    fn override_hyprland_does_not_fall_back_to_niri() {
+        use std::os::unix::net::UnixListener;
+        let t = tempfile::tempdir().unwrap();
+        // A live niri socket is present, so a fallback would succeed; the
+        // override must still fail because it names hyprland without a
+        // signature, so there is no Hyprland socket to reach.
+        let sock = t.path().join("niri.wayland-1.7.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let env = session_env(
+            t.path(),
+            None,
+            Some(&sock.to_string_lossy()),
+            Some("hyprland"),
+        );
+        let err = Compositor::detect(&env).unwrap_err().to_string();
+        assert!(err.contains("hyprland"), "got: {err}");
+        assert!(err.contains(".socket.sock"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_override_value_is_an_error() {
+        let t = tempfile::tempdir().unwrap();
+        let env = session_env(t.path(), None, None, Some("sway"));
+        let err = Compositor::detect(&env).unwrap_err().to_string();
+        assert!(err.contains("unknown RICE_COOKER_COMPOSITOR value"), "got: {err}");
+    }
+
+    #[test]
+    fn unset_override_still_detects_hyprland() {
+        let t = tempfile::tempdir().unwrap();
+        let sig = "abc123";
+        touch_hyprland_socket(t.path(), sig);
+        let env = session_env(t.path(), Some(sig), None, None);
+        assert_eq!(
+            Compositor::detect(&env).unwrap(),
+            Compositor::Hyprland { signature: sig.to_string() }
+        );
+    }
+
+    #[test]
+    fn unset_override_still_detects_niri() {
+        use std::os::unix::net::UnixListener;
+        let t = tempfile::tempdir().unwrap();
+        let sock = t.path().join("niri.wayland-1.7.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let env = session_env(
+            t.path(),
+            None,
+            Some(&sock.to_string_lossy()),
+            None,
+        );
+        assert_eq!(
+            Compositor::detect(&env).unwrap(),
+            Compositor::Niri { socket: sock }
+        );
     }
 }

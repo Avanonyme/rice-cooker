@@ -931,6 +931,7 @@ mod tests {
                 hyprland_signature: None,
                 niri_socket: None,
                 current_desktop: Some("niri".into()),
+                compositor_override: None,
                 proc_root: PathBuf::from("/proc"),
             },
         };

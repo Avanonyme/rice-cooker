@@ -29,6 +29,14 @@
       catalog = builtins.fromTOML (builtins.readFile ./backend/catalog.toml);
       riceNames = builtins.filter (n: n != "_catalog") (builtins.attrNames catalog);
 
+      # Union of every entry's `compositors`, with the same Hyprland-only
+      # default the backend applies to v1 entries that omit the key. Drives the
+      # module's `compositor` option so its accepted values cannot drift from
+      # what the backend can actually activate.
+      compositorIds = nixpkgs.lib.unique (
+        nixpkgs.lib.concatMap (name: catalog.${name}.compositors or [ "hyprland" ]) riceNames
+      );
+
       perSystem =
         system:
         let
@@ -188,14 +196,14 @@
       # `enable` is what forces a shell over whatever the user's own config does.
       homeManagerModules = {
         default = import ./nix/hm-module.nix {
-          inherit self catalog riceNames;
+          inherit self catalog riceNames compositorIds;
         };
         rice-cooker = self.homeManagerModules.default;
       };
 
       # Exposed so downstream configs (and the backend) can read the same list.
       lib = {
-        inherit catalog riceNames;
+        inherit catalog riceNames compositorIds;
         catalogPath = ./backend/catalog.toml;
       };
     };

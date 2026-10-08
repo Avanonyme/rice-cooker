@@ -253,6 +253,7 @@ mod tests {
             hyprland_signature: None,
             niri_socket: None,
             current_desktop: Some("niri".to_string()),
+            compositor_override: None,
             proc_root: root.join("proc"),
         }
     }

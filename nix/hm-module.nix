@@ -27,6 +27,7 @@
   self,
   catalog,
   riceNames,
+  compositorIds,
 }:
 {
   config,
@@ -42,6 +43,30 @@ let
   system = pkgs.stdenv.hostPlatform.system;
 
   entry = if cfg.shell == null then null else catalog.${cfg.shell};
+
+  # Compositors the selected rice declares. Mirrors the backend's default so a
+  # v1 entry that omits `compositors` counts as Hyprland-only.
+  riceCompositors =
+    if entry == null then [ ]
+    else entry.compositors or [ "hyprland" ];
+
+  # Case-insensitive compositor id. `check` runs on each definition before
+  # `merge`, so it must accept the raw value ("Niri"); lowercasing happens in
+  # `merge`, which is why a bare `apply = lib.toLower` would not work here.
+  compositorType = lib.mkOptionType {
+    name = "compositor";
+    description = "one of ${lib.concatStringsSep ", " compositorIds} (case-insensitive), or null";
+    check = value:
+      value == null
+      || (lib.isString value && lib.elem (lib.toLower value) compositorIds);
+    merge = loc: defs:
+      let
+        lowered = map (def: def // {
+          value = if def.value == null then null else lib.toLower def.value;
+        }) defs;
+      in
+        lib.mergeOneOption loc lowered;
+  };
 
   # The flake input the user supplied for the selected rice. Rice inputs are not
   # fetched here: `builtins.getFlake` needs impure evaluation, so the caller
@@ -130,6 +155,20 @@ in
       '';
     };
 
+    compositor = mkOption {
+      type = compositorType;
+      default = null;
+      example = "niri";
+      description = ''
+        Which compositor this machine runs. `null` detects it at runtime, which
+        is today's behaviour and keeps the default backwards compatible.
+
+        Because the value is known at evaluation time, a compositor the selected
+        rice does not support becomes a build-time assertion instead of a
+        runtime failure. Accepted values come from the shipped catalog.
+      '';
+    };
+
     rices = mkOption {
       type = types.attrsOf types.anything;
       default = { };
@@ -205,6 +244,18 @@ in
             has to be done by you rather than by programs.rice-cooker.
           '';
         }
+        {
+          # A compositor the rice does not declare is a build-time mismatch, not
+          # a runtime gamble. With `shell = null` (tool only) there is no rice to
+          # contradict, so nothing is asserted.
+          assertion = cfg.shell == null || cfg.compositor == null || lib.elem cfg.compositor riceCompositors;
+          message = ''
+            programs.rice-cooker: shell = "${toString cfg.shell}" declares
+            compositors [${lib.concatStringsSep ", " (map (c: "\"${c}\"") riceCompositors)}] but
+            compositor = "${cfg.compositor}" was requested. Pick one the rice
+            supports, or leave `compositor = null` to detect it at runtime.
+          '';
+        }
       ];
 
       warnings =
@@ -214,6 +265,12 @@ in
           + " is also enabled. Both will try to start a desktop shell; "
           + "disable the other one or its launcher will race this one.";
     }
+
+    (mkIf (cfg.compositor != null) {
+      # Make the runtime agree with the declaration. The backend reads this as an
+      # explicit override, so the module and the install engine cannot disagree.
+      home.sessionVariables.RICE_COOKER_COMPOSITOR = cfg.compositor;
+    })
 
     (mkIf (cfg.shell != null && riceInput != null) {
       home.packages = lib.optional (ricePackage != null) ricePackage;

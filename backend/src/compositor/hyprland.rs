@@ -161,6 +161,7 @@ mod tests {
             hyprland_signature: None,
             niri_socket: None,
             current_desktop: None,
+            compositor_override: None,
             proc_root: PathBuf::from("/proc"),
         };
         assert_eq!(

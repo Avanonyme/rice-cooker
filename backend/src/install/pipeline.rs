@@ -155,7 +155,13 @@ fn run_activate<W: Write>(
         }
     };
 
-    let platform = platform::detect();
+    let platform = match platform::detect() {
+        Ok(platform) => platform,
+        Err(e) => {
+            emit_fail(events, "preflight", &format!("{e:#}"), None)?;
+            return Ok(false);
+        }
+    };
 
     if mode == ActivateMode::Install && !entry.install_is_supported(platform) {
         let reason = match platform {

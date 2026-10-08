@@ -29,7 +29,7 @@ pub const CONFLICTING_SHELLS: &[&str] = &["waybar", "ags", "astal", "eww", "yamb
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvReport {
-    pub platform: &'static str,
+    pub platform: Option<&'static str>,
     pub compositor: Option<&'static str>,
     pub session_type: Option<String>,
     pub supported: bool,
@@ -39,8 +39,15 @@ pub struct EnvReport {
 }
 
 pub fn env_report() -> EnvReport {
-    let platform = detect();
     let mut reasons = Vec::new();
+
+    let platform = match detect() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            reasons.push(format!("{e:#}"));
+            None
+        }
+    };
 
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
     if session_type.as_deref() != Some("wayland") {
@@ -67,7 +74,7 @@ pub fn env_report() -> EnvReport {
     }
 
     EnvReport {
-        platform: platform.as_str(),
+        platform: platform.map(PlatformId::as_str),
         compositor,
         session_type,
         supported: reasons.is_empty(),
@@ -115,32 +122,33 @@ impl PlatformId {
     }
 }
 
-pub fn detect() -> PlatformId {
+pub fn detect() -> Result<PlatformId> {
     let over = std::env::var(PLATFORM_ENV).ok();
     detect_in(Path::new("/"), over.as_deref())
 }
 
 /// Split out so the marker logic is testable against a fixture root.
-pub fn detect_in(root: &Path, override_flag: Option<&str>) -> PlatformId {
-    if let Some(raw) = override_flag
-        && let Ok(id) = PlatformId::parse(raw)
-    {
-        return id;
+pub fn detect_in(root: &Path, override_flag: Option<&str>) -> Result<PlatformId> {
+    if let Some(raw) = override_flag {
+        // An explicit override that cannot be parsed is a user error. Falling
+        // through to the markers would silently pick a package manager the user
+        // did not ask for, and install with the wrong tool.
+        return PlatformId::parse(raw);
     }
     // /etc/NIXOS before /etc/arch-release: a NixOS host that has an
     // arch-release left behind by a container image is still NixOS.
     if root.join("etc/NIXOS").exists() {
-        return PlatformId::Nix;
+        return Ok(PlatformId::Nix);
     }
     if root.join("etc/arch-release").exists() {
-        return PlatformId::Arch;
+        return Ok(PlatformId::Arch);
     }
     // No marker either way (a bare container, a non-NixOS host using nix).
-    if which("nix").is_some() && which("pacman").is_none() {
+    Ok(if which("nix").is_some() && which("pacman").is_none() {
         PlatformId::Nix
     } else {
         PlatformId::Arch
-    }
+    })
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
@@ -326,8 +334,8 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(t.path().join("etc")).unwrap();
         std::fs::write(t.path().join("etc/arch-release"), b"").unwrap();
-        assert_eq!(detect_in(t.path(), Some("nix")), PlatformId::Nix);
-        assert_eq!(detect_in(t.path(), Some("arch")), PlatformId::Arch);
+        assert_eq!(detect_in(t.path(), Some("nix")).unwrap(), PlatformId::Nix);
+        assert_eq!(detect_in(t.path(), Some("arch")).unwrap(), PlatformId::Arch);
     }
 
     #[test]
@@ -336,7 +344,7 @@ mod tests {
         std::fs::create_dir_all(t.path().join("etc")).unwrap();
         std::fs::write(t.path().join("etc/arch-release"), b"").unwrap();
         std::fs::write(t.path().join("etc/NIXOS"), b"").unwrap();
-        assert_eq!(detect_in(t.path(), None), PlatformId::Nix);
+        assert_eq!(detect_in(t.path(), None).unwrap(), PlatformId::Nix);
     }
 
     #[test]
@@ -345,16 +353,25 @@ mod tests {
         std::fs::create_dir_all(t.path().join("etc")).unwrap();
         std::fs::write(t.path().join("etc/arch-release"), b"").unwrap();
         // No env mutation needed: a marker alone decides, before any PATH probe.
-        assert_eq!(detect_in(t.path(), None), PlatformId::Arch);
+        assert_eq!(detect_in(t.path(), None).unwrap(), PlatformId::Arch);
     }
 
     #[test]
     fn unknown_platform_override_value_is_reported() {
         let err = PlatformId::parse("fedora").unwrap_err().to_string();
         assert!(err.contains("unknown"), "got: {err}");
-        // An unparseable override must not silently become Arch.
+        // An unparseable override must not silently become Arch — not even on a
+        // host with no marker of its own, which is what this fixture root is.
         let t = tempfile::tempdir().unwrap();
-        assert_ne!(detect_in(t.path(), Some("fedora")), PlatformId::Arch);
+        let err = detect_in(t.path(), Some("fedora")).unwrap_err().to_string();
+        assert!(err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn no_override_and_no_marker_still_resolves() {
+        // The fallback must stay infallible: only an explicit bad value errors.
+        let t = tempfile::tempdir().unwrap();
+        assert!(detect_in(t.path(), None).is_ok());
     }
 
     #[test]

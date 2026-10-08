@@ -83,7 +83,7 @@ fn run() -> Result<bool> {
         }
         Cmd::List => {
             let cat = Catalog::from_file(&catalog_path(&paths, cli.catalog.as_deref())?)?;
-            let rows = install::list(&cat, &paths, platform::detect())?;
+            let rows = install::list(&cat, &paths, platform::detect()?)?;
             serde_json::to_writer_pretty(std::io::stdout(), &rows)?;
             println!();
             Ok(true)

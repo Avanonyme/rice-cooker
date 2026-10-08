@@ -484,6 +484,9 @@ fn proc_pids(proc_root: &Path) -> Result<Vec<u32>> {
             out.push(pid);
         }
     }
+    // `read_dir` yields filesystem order, which differs between ext4 and APFS.
+    // Callers (and tests) need a stable answer.
+    out.sort_unstable();
     Ok(out)
 }
 

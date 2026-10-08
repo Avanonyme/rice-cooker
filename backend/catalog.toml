@@ -13,14 +13,15 @@
 display_name = "Noctalia"
 creator_name = "noctalia-dev"
 repo = "https://github.com/noctalia-dev/noctalia-shell"
-commit = "d7b68652e79bce5813dc4fea7e51636a5da3e1b7"
+commit = "3e159ec301f8916e3bfd17c178258fa030f40e39"
 symlink_src = "."
 symlink_dst = "~/.config/quickshell/noctalia"
 compositors = ["hyprland", "niri"]
-# Measured shapes are unclear for this shell, so accept either: the shell's own
-# `noctalia-*` surfaces, or the plain quickshell namespace. Narrow it once
-# `niri msg layers` has been read on a live session.
-layer_namespaces = ["^noctalia-", "^quickshell"]
+# v5 is C++ and renders its own layer surfaces, so it never uses the quickshell
+# namespace: `^noctalia-` is the only plausible prefix, and it matches the
+# `^noctalia-overview*` layer rule noctalia's own niri docs require. Still worth
+# one `niri msg layers` confirmation.
+layer_namespaces = ["^noctalia-"]
 install_deps = [
   "noctalia-shell",
   "cliphist",
@@ -30,10 +31,13 @@ install_deps = [
   "wl-clipboard",
   "wtype"
 ]
-preview_deps = ["noctalia-qs"]
+# `noctalia-qs` was the quickshell fork v4 ran on. v5 has no quickshell at all,
+# so installing it for a preview was pulling an obsolete shell.
+preview_deps = []
 
 # Nix side. noctalia's flake exposes `homeModules.default` and its own
-# `programs.noctalia`, so it is a `module` rice. Its Arch side (the symlink
+# `programs.noctalia`, so it is a `module` rice — and since v5 that flake has
+# only one input, `nixpkgs`: no quickshell, no QML. Its Arch side (the symlink
 # above) is independent of this and still applies there.
 [noctalia.launch]
 kind = "argv"
@@ -43,7 +47,7 @@ argv = ["noctalia"]
 shape = "module"
 module = "homeModules.default"
 hm_option = "programs.noctalia.enable"
-flake = "github:noctalia-dev/noctalia-shell/d7b68652e79bce5813dc4fea7e51636a5da3e1b7"
+flake = "github:noctalia-dev/noctalia-shell/3e159ec301f8916e3bfd17c178258fa030f40e39"
 
 [linux-retroism]
 display_name = "linux-retroism"

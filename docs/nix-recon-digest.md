@@ -206,6 +206,13 @@ must target a *standalone* HM configuration (its own flake), not the NixOS-modul
 - Catalog entry for it currently has `install_deps = ["noctalia-shell", …]` and
   `preview_deps = ["noctalia-qs"]` — note the quickshell *fork* requirement.
 
+**Correction (noctalia v5.2.1).** This section described the quickshell-era
+revision. noctalia is now **C++** — 794 `.cpp`, 807 `.h`, 27 `.cc`, and zero
+`.qmh`/`.qml` files — and its flake has exactly one input, `nixpkgs`: no
+quickshell, no QML. So `noctalia-qs` is obsolete, the layer surfaces cannot be
+`quickshell:*`, and the catalog pin was building the old Qt shell. `programs.noctalia`
+and `homeModules.default` are unchanged, so the module rice shape still holds.
+
 **Cross-cutting conclusion:** a "nix rice" can be any of three shapes, and the
 architecture must dispatch on shape rather than assume one:
 

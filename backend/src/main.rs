@@ -8,6 +8,7 @@ use rice_cooker_backend::catalog::Catalog;
 use rice_cooker_backend::events::EventWriter;
 use rice_cooker_backend::install::{self, Flags};
 use rice_cooker_backend::paths::Paths;
+use rice_cooker_backend::platform;
 
 #[derive(Parser)]
 #[command(name = "rice-cooker-backend", about = "Quickshell rice install engine")]
@@ -33,6 +34,8 @@ enum Cmd {
     },
     /// List catalog entries (JSON).
     List,
+    /// Report the detected platform, compositor and blockers (JSON).
+    Env,
     /// Print the active rice's install record (JSON).
     Status,
 }
@@ -71,6 +74,12 @@ fn run() -> Result<bool> {
             let mut lock = stdout.lock();
             let mut events = EventWriter::new(&mut lock);
             install::run_uninstall(&paths, Flags { force: *force }, &mut events)
+        }
+        Cmd::Env => {
+            let report = platform::env_report();
+            serde_json::to_writer_pretty(std::io::stdout(), &report)?;
+            println!();
+            Ok(true)
         }
         Cmd::List => {
             let cat = Catalog::from_file(&catalog_path(&paths, cli.catalog.as_deref())?)?;

@@ -11,7 +11,7 @@ import {
   type PreviewOption,
   type View,
 } from './view';
-import type { BackendRunRequest, RiceListRow } from '@/shared/backend';
+import type { BackendRunRequest, EnvironmentCheckResult, RiceListRow } from '@/shared/backend';
 import { GreenTab } from './components/GreenTab';
 import { RiceCard } from './components/RiceCard';
 import { ScreenContent } from './components/ScreenContent';
@@ -41,8 +41,17 @@ import { MENU_ITEMS, type MenuItem } from './menuOptions';
 
 const clampRiceIndex = (index: number, count: number) => Math.max(0, Math.min(count - 1, index));
 type HoldDirection = -1 | 0 | 1;
-const BOOT_DESCRIPTION = 'Rice Cooker is only built for arch + hyprland + quickshell.';
+const BOOT_DESCRIPTION = 'Rice Cooker needs a supported Wayland session (Hyprland or niri).';
 const CONFLICTING_RICE_DESCRIPTION = 'Please close any other rice! Rice cooker only supports quickshell.';
+
+/**
+ * Prefer the backend's own explanation: it knows the platform and the
+ * compositor, and its message names the actual blocker rather than a generic one.
+ */
+function describeBlocker(result: EnvironmentCheckResult): string {
+  if (result.conflictingShells.length > 0) return CONFLICTING_RICE_DESCRIPTION;
+  return result.reasons[0] ?? BOOT_DESCRIPTION;
+}
 const LAUNCH_FALLBACK_MS = 1500;
 const MENU_FADE_MS = 100;
 const cyclePreviewOption = (option: PreviewOption, delta: -1 | 1) => {
@@ -130,7 +139,7 @@ export function PickARice() {
       .then((result) => {
         if (cancelled) return;
         const blockedByShell = result.conflictingShells.length > 0;
-        setBootDescription(blockedByShell ? CONFLICTING_RICE_DESCRIPTION : BOOT_DESCRIPTION);
+        setBootDescription(describeBlocker(result));
         setBootDescriptionWide(blockedByShell);
         setBootBlockedByShell(blockedByShell);
         setBootOpen(!result.supported);
@@ -155,7 +164,7 @@ export function PickARice() {
         const blockedByShell = result.conflictingShells.length > 0;
         if (blockedByShell) return;
         setBootBlockedByShell(false);
-        setBootDescription(BOOT_DESCRIPTION);
+        setBootDescription(describeBlocker(result));
         setBootDescriptionWide(false);
         setBootOpen(!result.supported);
       });

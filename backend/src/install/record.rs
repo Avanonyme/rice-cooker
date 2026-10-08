@@ -26,7 +26,28 @@ pub struct InstallRecord {
     pub symlink_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<PathBuf>,
+    /// Present when the rice was realized from a Nix flake.
+    ///
+    /// Mutually exclusive with `pacman_diff` and the symlink pair: on Nix there
+    /// are no packages to diff and nothing to link, so undo is simply "stop the
+    /// shell and replay what was running before".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix: Option<NixInstall>,
     pub pacman_diff: PacmanDiff,
+}
+
+/// What a Nix-realized rice leaves behind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NixInstall {
+    /// The built store path the shell was launched from.
+    pub store_path: PathBuf,
+    /// The exact argv used, so a relaunch or a revert does not have to re-derive
+    /// it from a catalog that may have changed.
+    pub launch_argv: Vec<String>,
+    /// Where the adopt-this-config snippet was written, set by `install` on Nix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -200,6 +221,7 @@ mod tests {
             installed_at: InstallRecord::now_rfc3339(),
             symlink_path: Some(PathBuf::from("/home/x/.config/quickshell/dms")),
             symlink_target: Some(PathBuf::from("/home/x/.cache/rice-cooker/rices/dms")),
+            nix: None,
             pacman_diff: PacmanDiff {
                 added_explicit: vec!["caelestia-shell-git".into()],
                 removed: Vec::new(),
@@ -257,5 +279,51 @@ mod tests {
         )
         .unwrap();
         assert!(load_record(&path).is_err());
+    }
+
+    #[test]
+    fn nix_install_round_trips() {
+        let (_t, p) = tmp_paths();
+        let mut r = sample();
+        r.nix = Some(NixInstall {
+            store_path: PathBuf::from("/nix/store/abc-caelestia-shell-1.0.0"),
+            launch_argv: vec!["/nix/store/abc-caelestia-shell-1.0.0/bin/caelestia-shell".into()],
+            snippet_path: None,
+        });
+        let path = p.record_json(&r.name).unwrap();
+        save_record(&path, &r).unwrap();
+        assert_eq!(load_record(&path).unwrap(), r);
+    }
+
+    #[test]
+    fn a_record_without_a_nix_field_still_loads() {
+        // Records written before the field existed must keep parsing, so a
+        // downgrade stays readable.
+        let (_t, p) = tmp_paths();
+        let path = p.record_json("x").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"schema_version":1,"name":"x","commit":"a","installed_at":"","pacman_diff":{}}"#,
+        )
+        .unwrap();
+        let r = load_record(&path).unwrap();
+        assert!(r.nix.is_none());
+    }
+
+    #[test]
+    fn a_nix_record_omits_the_pacman_diff_on_the_wire() {
+        let (_t, p) = tmp_paths();
+        let mut r = sample();
+        r.nix = Some(NixInstall {
+            store_path: PathBuf::from("/nix/store/abc-x"),
+            launch_argv: vec!["/nix/store/abc-x/bin/x".into()],
+            snippet_path: Some(PathBuf::from("/home/x/.local/share/rice-cooker/install-snippets/x.nix")),
+        });
+        let path = p.record_json(&r.name).unwrap();
+        save_record(&path, &r).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"nix\""), "the nix block should be serialized");
+        assert!(body.contains("snippet_path"));
     }
 }

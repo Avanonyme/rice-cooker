@@ -6,4 +6,5 @@ pub mod git;
 pub mod install;
 pub mod lock;
 pub mod paths;
+pub mod platform;
 pub mod process;

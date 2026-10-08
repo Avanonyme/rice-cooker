@@ -10,16 +10,20 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 
 use crate::catalog::{Catalog, RiceEntry};
+use crate::compositor;
 use crate::deps;
 use crate::events::{Event, EventWriter, SCHEMA_VERSION as EVENT_SCHEMA_VERSION, Step, StepState};
 use crate::git;
 use crate::lock::{Lock, LockError};
 use crate::paths::{OriginalShell, Paths, expand_config_path};
+use crate::platform::{self, PlatformId};
 use crate::process::{self, VerifyResult};
+use regex::Regex;
 
 use super::record::{
-    InstallRecord, PacmanDiff, PendingDeps, SCHEMA_VERSION, clear_current, clear_pending_deps,
-    load_pending_deps, load_record, read_current, save_pending_deps, save_record, write_current,
+    InstallRecord, NixInstall, PacmanDiff, PendingDeps, SCHEMA_VERSION, clear_current,
+    clear_pending_deps, load_pending_deps, load_record, read_current, save_pending_deps,
+    save_record, write_current,
 };
 use super::symlink as symlink_shape;
 
@@ -47,6 +51,19 @@ pub struct StatusRow {
 enum ActivateMode {
     Install,
     Preview,
+}
+
+/// How the rice's shell is started once realized, and therefore how it is
+/// verified. Arch launches `quickshell -c <name>` and is verified by process
+/// name; Nix launches an explicit argv from a store path and is verified by
+/// argv matching plus layer ownership, because the store path is not a fixed
+/// program name.
+enum LaunchPlan {
+    ByName,
+    Nix {
+        launch_argv: Vec<String>,
+        namespaces: Vec<Regex>,
+    },
 }
 
 impl ActivateMode {
@@ -138,13 +155,19 @@ fn run_activate<W: Write>(
         }
     };
 
-    if mode == ActivateMode::Install && entry.install_deps.is_empty() {
-        emit_fail(
-            events,
-            "preflight",
-            &format!("{name}: install is not supported; use preview instead"),
-            None,
-        )?;
+    let platform = platform::detect();
+
+    if mode == ActivateMode::Install && !entry.install_is_supported(platform) {
+        let reason = match platform {
+            PlatformId::Arch => format!(
+                "{name}: install is not supported; use preview instead"
+            ),
+            PlatformId::Nix => format!(
+                "{name}: install is not supported: the catalog entry declares no [nix] block, \
+                 so there is no configuration to emit"
+            ),
+        };
+        emit_fail(events, "preflight", &reason, None)?;
         return Ok(false);
     }
 
@@ -152,13 +175,32 @@ fn run_activate<W: Write>(
 
     step(events, Step::Preflight, StepState::Start)?;
     try_stage!(events, "preflight", "git", git::preflight());
-    try_stage!(
+    let session = try_stage!(
         events,
         "preflight",
         "graphical_session",
         process::check_graphical_session()
     );
-    if !selected_deps.is_empty() {
+    // The compositor is a declared capability, not an assumption. A Hyprland-only
+    // rice must fail cleanly on niri rather than half-install.
+    let compositor_id = session.compositor_id();
+    if !entry.supports(compositor_id) {
+        let declared = entry
+            .compositors
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        emit_fail(
+            events,
+            "preflight",
+            &format!("{name}: does not support {compositor_id} (declares {declared})"),
+            None,
+        )?;
+        return Ok(false);
+    }
+    // Only Arch needs an AUR helper and its polkit prompt.
+    if platform == PlatformId::Arch && !selected_deps.is_empty() {
         try_stage!(
             events,
             "preflight",
@@ -180,17 +222,25 @@ fn run_activate<W: Write>(
     let mut prior_pacman_diff = PacmanDiff::default();
     let same_current = current.as_deref() == Some(name);
     if same_current {
-        // current.json can be stale (crash, manual kill) — only short-circuit
-        // if the process is actually running and the requested deps are present.
-        let alive = try_stage!(events, "liveness", process::rice_shell_alive(name));
-        if alive && try_stage!(events, "deps", deps::missing(selected_deps)).is_empty() {
+        // current.json can be stale (crash, manual kill) — only short-circuit if
+        // the shell is actually running and the rice's requirements are met.
+        let record_path = try_stage!(events, "record", "path", paths.record_json(name));
+        let record = try_stage!(events, "record", "load", load_record(&record_path));
+        let alive = match &record.nix {
+            Some(nix) => try_stage!(events, "liveness", shell_alive_for(nix)),
+            None => try_stage!(events, "liveness", process::rice_shell_alive(name)),
+        };
+        // A Nix rice has no package work: the store path is the whole closure.
+        let satisfied = match &record.nix {
+            Some(_) => true,
+            None => try_stage!(events, "deps", deps::missing(selected_deps)).is_empty(),
+        };
+        if alive && satisfied {
             events.emit(&Event::Success {
                 active: Some(name.to_string()),
             })?;
             return Ok(true);
         }
-        let record_path = try_stage!(events, "record", "path", paths.record_json(name));
-        let record = try_stage!(events, "record", "load", load_record(&record_path));
         prior_pacman_diff = record.pacman_diff;
     }
 
@@ -203,56 +253,119 @@ fn run_activate<W: Write>(
         step(events, Step::Evict, StepState::Done)?;
     }
 
-    step(events, Step::Clone, StepState::Start)?;
-    try_stage!(events, "clone", do_clone(paths, name, entry));
-    step(events, Step::Clone, StepState::Done)?;
+    // ── realize: platform-specific ──────────────────────────────────────────
+    // Arch clones a repo and installs packages, then links a config directory.
+    // Nix builds a flake and needs neither: a Nix-packaged shell is a wrapper
+    // carrying its own config path, so there is nothing to symlink.
+    let plan: LaunchPlan = if platform == PlatformId::Nix {
+        let nix = entry
+            .nix
+            .as_ref()
+            .expect("install_is_supported checked that [nix] is present");
+        let flake = nix.flake_ref(&entry.repo, &entry.commit);
 
-    step(events, Step::Deps, StepState::Start)?;
-    let deps_outcome = try_stage!(events, "deps", do_deps(paths, name, entry, selected_deps));
-    if deps_outcome.install_error.is_none() {
+        step(events, Step::Deps, StepState::Start)?;
+        let store_path = match platform::build_store_path(&flake, nix.package_attr()) {
+            Ok(path) => path,
+            Err(e) => {
+                emit_fail(events, "deps", &format!("{e:#}"), None)?;
+                return Ok(false);
+            }
+        };
         step(events, Step::Deps, StepState::Done)?;
-    }
-    let mut pacman_diff = deps_outcome.pacman_diff;
-    let current_run_changed =
-        !pacman_diff.added_explicit.is_empty() || !pacman_diff.removed.is_empty();
-    pacman_diff.added_explicit =
-        union_sorted(prior_pacman_diff.added_explicit, pacman_diff.added_explicit);
-    if same_current {
-        pacman_diff.removed = union_sorted(prior_pacman_diff.removed, pacman_diff.removed);
-    }
-    if let Some(reason) = deps_outcome.install_error {
-        if current_run_changed {
-            step(events, Step::Record, StepState::Start)?;
-            try_stage!(events, "record", do_record(paths, name, entry, pacman_diff));
-            try_stage!(events, "record", clear_pending_deps(paths));
-            step(events, Step::Record, StepState::Done)?;
-            return fail_and_rollback_activation(paths, events, name, "deps", &reason, None);
-        } else {
-            try_stage!(events, "deps", clear_pending_deps(paths));
-        }
-        emit_fail(events, "deps", &reason, None)?;
-        return Ok(false);
-    }
 
-    // Record persists BEFORE symlink so a symlink failure still leaves
-    // a record uninstall can use to roll back the packages.
-    step(events, Step::Record, StepState::Start)?;
-    try_stage!(events, "record", do_record(paths, name, entry, pacman_diff));
-    try_stage!(events, "record", clear_pending_deps(paths));
-    step(events, Step::Record, StepState::Done)?;
-
-    step(events, Step::Symlink, StepState::Start)?;
-    if let Err(e) = do_symlink(paths, name, entry) {
-        return fail_and_rollback_activation(
-            paths,
+        let launch_argv = platform::launch_argv(entry, name, &store_path);
+        let namespaces = try_stage!(
             events,
-            name,
-            "symlink",
-            &format!("{e:#}"),
-            None,
+            "preflight",
+            "layer_namespaces",
+            compositor::compile_namespaces(compositor_id, &entry.layer_namespaces)
         );
-    }
-    step(events, Step::Symlink, StepState::Done)?;
+        // On Nix, `install` cannot mutate a declarative system, so it emits the
+        // configuration the user adopts instead.
+        let snippet_path = if mode == ActivateMode::Install {
+            Some(try_stage!(
+                events,
+                "record",
+                platform::write_install_snippet(paths, name)
+            ))
+        } else {
+            None
+        };
+
+        step(events, Step::Record, StepState::Start)?;
+        try_stage!(
+            events,
+            "record",
+            do_record_nix(
+                paths,
+                name,
+                entry,
+                &store_path,
+                &launch_argv,
+                snippet_path
+            )
+        );
+        step(events, Step::Record, StepState::Done)?;
+
+        LaunchPlan::Nix {
+            launch_argv,
+            namespaces,
+        }
+    } else {
+        step(events, Step::Clone, StepState::Start)?;
+        try_stage!(events, "clone", do_clone(paths, name, entry));
+        step(events, Step::Clone, StepState::Done)?;
+
+        step(events, Step::Deps, StepState::Start)?;
+        let deps_outcome = try_stage!(events, "deps", do_deps(paths, name, entry, selected_deps));
+        if deps_outcome.install_error.is_none() {
+            step(events, Step::Deps, StepState::Done)?;
+        }
+        let mut pacman_diff = deps_outcome.pacman_diff;
+        let current_run_changed =
+            !pacman_diff.added_explicit.is_empty() || !pacman_diff.removed.is_empty();
+        pacman_diff.added_explicit =
+            union_sorted(prior_pacman_diff.added_explicit, pacman_diff.added_explicit);
+        if same_current {
+            pacman_diff.removed = union_sorted(prior_pacman_diff.removed, pacman_diff.removed);
+        }
+        if let Some(reason) = deps_outcome.install_error {
+            if current_run_changed {
+                step(events, Step::Record, StepState::Start)?;
+                try_stage!(events, "record", do_record(paths, name, entry, pacman_diff));
+                try_stage!(events, "record", clear_pending_deps(paths));
+                step(events, Step::Record, StepState::Done)?;
+                return fail_and_rollback_activation(paths, events, name, "deps", &reason, None);
+            } else {
+                try_stage!(events, "deps", clear_pending_deps(paths));
+            }
+            emit_fail(events, "deps", &reason, None)?;
+            return Ok(false);
+        }
+
+        // Record persists BEFORE symlink so a symlink failure still leaves
+        // a record uninstall can use to roll back the packages.
+        step(events, Step::Record, StepState::Start)?;
+        try_stage!(events, "record", do_record(paths, name, entry, pacman_diff));
+        try_stage!(events, "record", clear_pending_deps(paths));
+        step(events, Step::Record, StepState::Done)?;
+
+        step(events, Step::Symlink, StepState::Start)?;
+        if let Err(e) = do_symlink(paths, name, entry) {
+            return fail_and_rollback_activation(
+                paths,
+                events,
+                name,
+                "symlink",
+                &format!("{e:#}"),
+                None,
+            );
+        }
+        step(events, Step::Symlink, StepState::Done)?;
+
+        LaunchPlan::ByName
+    };
 
     step(events, Step::Notifiers, StepState::Start)?;
     if let Err(e) = process::kill_notif_daemons() {
@@ -280,9 +393,23 @@ fn run_activate<W: Write>(
     }
     step(events, Step::KillQuickshell, StepState::Done)?;
 
+    // Snapshot taken after eviction and before launch: a surface the outgoing
+    // shell left behind must not be read as the new shell having come up. Only
+    // the Nix plan needs it; on Hyprland the pid evidence alone suffices.
+    let baseline = match &plan {
+        LaunchPlan::Nix { .. } => session.compositor.layers().unwrap_or_default(),
+        LaunchPlan::ByName => Vec::new(),
+    };
+
     let log_file = paths.last_run_log();
     step(events, Step::Launch, StepState::Start)?;
-    if let Err(e) = process::launch_detached_by_name(name, &log_file, &paths.home) {
+    let launched = match &plan {
+        LaunchPlan::ByName => process::launch_detached_by_name(name, &log_file, &paths.home),
+        LaunchPlan::Nix { launch_argv, .. } => {
+            process::launch_argv(launch_argv, &paths.home, &log_file)
+        }
+    };
+    if let Err(e) = launched {
         let tail = read_tail(&log_file);
         return fail_and_rollback_activation(
             paths,
@@ -296,7 +423,32 @@ fn run_activate<W: Write>(
     step(events, Step::Launch, StepState::Done)?;
 
     step(events, Step::Verify, StepState::Start)?;
-    let verify_result = match process::verify_by_name(name, &log_file) {
+    let verify_result = match &plan {
+        LaunchPlan::ByName => process::verify_by_name(name, &log_file),
+        LaunchPlan::Nix {
+            launch_argv,
+            namespaces,
+        } => {
+            let matcher = match launch_argv.first() {
+                Some(argv0) => {
+                    process::ShellMatcher::new([process::normalize_shell_name(argv0)])
+                }
+                None => process::ShellMatcher::new([name]),
+            };
+            let probe = process::OwnershipProbe {
+                compositor: &session.compositor,
+                namespaces,
+                baseline: &baseline,
+            };
+            process::verify_argv(
+                &matcher,
+                Path::new(process::PROC_ROOT),
+                &log_file,
+                Some(&probe),
+            )
+        }
+    };
+    let verify_result = match verify_result {
         Ok(r) => r,
         Err(e) => {
             let tail = read_tail(&log_file);
@@ -377,6 +529,10 @@ fn uninstall_locked<W: Write>(
     try_stage!(events, "kill_quickshell", process::kill_quickshell());
     step(events, Step::KillQuickshell, StepState::Done)?;
 
+    // A Nix record has no packages to remove and no symlink to drop: the store
+    // path is garbage-collected on its own, and undo is simply stopping the
+    // shell, which the KillQuickshell step below already did.
+    if record.nix.is_none() {
     // Pre-filter via pacman -Q so retries don't abort on "target not found".
     step(events, Step::Deps, StepState::Start)?;
     if !record.pacman_diff.added_explicit.is_empty() {
@@ -427,6 +583,7 @@ fn uninstall_locked<W: Write>(
     step(events, Step::Symlink, StepState::Start)?;
     try_stage!(events, "symlink", remove_rice_symlink(&record));
     step(events, Step::Symlink, StepState::Done)?;
+    }
 
     // Clear the pointer (current.json) BEFORE the target (record) — so if the
     // record removal then fails, status still reports None sanely.
@@ -705,6 +862,8 @@ fn reconcile_pending_deps(paths: &Paths) -> Result<()> {
             installed_at: InstallRecord::now_rfc3339(),
             symlink_path: pending.symlink_path,
             symlink_target: pending.symlink_target,
+            // The pending-deps journal only ever covers the Arch path.
+            nix: None,
             pacman_diff,
         };
         save_record(&paths.record_json(&pending.name)?, &record)?;
@@ -728,10 +887,51 @@ fn do_record(paths: &Paths, name: &str, entry: &RiceEntry, pacman_diff: PacmanDi
         installed_at: InstallRecord::now_rfc3339(),
         symlink_path: symlink_path_for(paths, entry),
         symlink_target: symlink_target_for(paths, name, entry)?,
+        nix: None,
         pacman_diff,
     };
     save_record(&paths.record_json(name)?, &record)?;
     write_current(paths, name)
+}
+
+/// The install record for a rice realized from a Nix flake.
+fn do_record_nix(
+    paths: &Paths,
+    name: &str,
+    entry: &RiceEntry,
+    store_path: &Path,
+    launch_argv: &[String],
+    snippet_path: Option<PathBuf>,
+) -> Result<()> {
+    let record = InstallRecord {
+        schema_version: SCHEMA_VERSION,
+        name: name.to_string(),
+        commit: entry.commit.clone(),
+        installed_at: InstallRecord::now_rfc3339(),
+        // Nothing is linked and no package diff exists on Nix.
+        symlink_path: None,
+        symlink_target: None,
+        nix: Some(NixInstall {
+            store_path: store_path.to_path_buf(),
+            launch_argv: launch_argv.to_vec(),
+            snippet_path,
+        }),
+        pacman_diff: PacmanDiff::default(),
+    };
+    save_record(&paths.record_json(name)?, &record)?;
+    write_current(paths, name)
+}
+
+/// Is the shell recorded for this Nix rice still running?
+///
+/// Not `rice_shell_alive`: that matches `quickshell -c <name>`, and a Nix shell
+/// is a store path whose argv0 basename is the rice's own binary.
+fn shell_alive_for(nix: &NixInstall) -> Result<bool> {
+    let Some(argv0) = nix.launch_argv.first() else {
+        return Ok(false);
+    };
+    let matcher = process::ShellMatcher::new([process::normalize_shell_name(argv0)]);
+    Ok(!process::matching_pids(Path::new(process::PROC_ROOT), &matcher)?.is_empty())
 }
 
 fn do_symlink(paths: &Paths, name: &str, entry: &RiceEntry) -> Result<()> {

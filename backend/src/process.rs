@@ -2,9 +2,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::{env, fs};
+use std::fs;
 
 use anyhow::{Context, Result, anyhow};
+use regex::Regex;
+
+use crate::compositor::{Compositor, CompositorId, LayerSurface, Ownership, SessionEnv};
 
 const KILL_POLL_MS: u64 = 50;
 const KILL_WAIT_MS: u64 = 500;
@@ -12,21 +15,38 @@ const VERIFY_POLL_MS: u64 = 250;
 const VERIFY_TIMEOUT_MS: u64 = 10_000;
 const LOG_TAIL_LINES: usize = 20;
 
-pub fn check_graphical_session() -> Result<()> {
-    let var = |key| env::var(key).ok().filter(|v| !v.is_empty());
-    for key in [
-        "XDG_RUNTIME_DIR",
-        "WAYLAND_DISPLAY",
-        "HYPRLAND_INSTANCE_SIGNATURE",
+/// A usable graphical session: the environment plus the compositor we will talk to.
+///
+/// The compositor is detected here rather than assumed, so a niri session is a
+/// first-class target and not a failure.
+pub struct Session {
+    pub runtime_dir: PathBuf,
+    pub wayland_display: Option<String>,
+    pub compositor: Compositor,
+    /// Kept so callers can pass it on without re-reading the environment.
+    pub env: SessionEnv,
+}
+
+impl Session {
+    pub fn compositor_id(&self) -> CompositorId {
+        self.compositor.id()
+    }
+}
+
+pub fn check_graphical_session() -> Result<Session> {
+    let env = SessionEnv::from_process();
+    for (key, value) in [
+        ("XDG_RUNTIME_DIR", env.runtime_dir.to_str()),
+        ("WAYLAND_DISPLAY", env.wayland_display.as_deref()),
     ] {
-        if var(key).is_none() {
+        if value.is_none_or(str::is_empty) {
             return Err(anyhow!(
-                "not running inside a usable Hyprland session: missing {key}; \
-                 launch Rice Cooker from the Hyprland user session you want to rice"
+                "not running inside a usable Wayland session: missing {key}; \
+                 launch Rice Cooker from the desktop session you want to rice"
             ));
         }
     }
-    let runtime = PathBuf::from(var("XDG_RUNTIME_DIR").expect("checked above"));
+    let runtime = env.runtime_dir.clone();
     if !runtime.is_absolute() || !runtime.is_dir() {
         return Err(anyhow!(
             "XDG_RUNTIME_DIR is not an absolute directory: {runtime:?}"
@@ -36,7 +56,14 @@ pub fn check_graphical_session() -> Result<()> {
     fs::create_dir(&probe)
         .with_context(|| format!("XDG_RUNTIME_DIR is not writable: {runtime:?}"))?;
     let _ = fs::remove_dir(&probe);
-    Ok(())
+
+    let compositor = Compositor::detect(&env)?;
+    Ok(Session {
+        runtime_dir: runtime,
+        wayland_display: env.wayland_display.clone(),
+        compositor,
+        env,
+    })
 }
 
 pub fn kill_notif_daemons() -> Result<()> {
@@ -123,6 +150,11 @@ impl ShellMatcher {
         &self.names
     }
 
+    /// Human-readable form for error messages.
+    pub fn label(&self) -> String {
+        self.names.join("|")
+    }
+
     /// Match on argv0 *or* the resolved executable, because a wrapper script's
     /// argv0 is the wrapper while its `exe` is the interpreter.
     pub fn matches(&self, argv: &[String], exe: Option<&Path>) -> bool {
@@ -177,7 +209,7 @@ pub fn kill_shells(proc_root: &Path, matcher: &ShellMatcher) -> Result<()> {
     Ok(())
 }
 
-fn signal(pids: &[i32], sig: &str) -> Result<()> {
+fn signal(pids: &[u32], sig: &str) -> Result<()> {
     let status = Command::new("kill")
         .arg(sig)
         .args(pids.iter().map(|p| p.to_string()))
@@ -192,7 +224,7 @@ fn signal(pids: &[i32], sig: &str) -> Result<()> {
 }
 
 /// Pids whose argv0 or executable name matches, scanned from `proc_root`.
-pub fn matching_pids(proc_root: &Path, matcher: &ShellMatcher) -> Result<Vec<i32>> {
+pub fn matching_pids(proc_root: &Path, matcher: &ShellMatcher) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     for pid in proc_pids(proc_root)? {
         let Some(proc_entry) = read_proc_entry(proc_root, pid)? else {
@@ -302,6 +334,95 @@ pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
     }
 }
 
+/// Layer-ownership evidence for a shell launched from an explicit argv.
+///
+/// Assembled by the caller so this module needs no catalog knowledge. `baseline`
+/// must be a snapshot taken *after* eviction and *before* launch, so that a
+/// surviving surface from the outgoing shell cannot be mistaken for the new one.
+pub struct OwnershipProbe<'a> {
+    pub compositor: &'a Compositor,
+    /// Compiled from the catalog entry's `layer_namespaces`.
+    pub namespaces: &'a [Regex],
+    pub baseline: &'a [LayerSurface],
+}
+
+/// Verify a shell launched from an explicit argv — the Nix path, where the binary
+/// is a store path rather than `quickshell -c <name>`.
+///
+/// Liveness comes from procfs argv/exe matching instead of a fixed `pgrep -xf`
+/// pattern, because a store path can carry a Nix `.foo-wrapped` name. Ownership
+/// comes from the compositor: on Hyprland via pid, on niri via layer namespace,
+/// since niri reports no pid at all.
+pub fn verify_argv(
+    matcher: &ShellMatcher,
+    proc_root: &Path,
+    log_file: &Path,
+    ownership: Option<&OwnershipProbe<'_>>,
+) -> Result<VerifyResult> {
+    let label = matcher.label();
+    let deadline = Instant::now() + Duration::from_millis(VERIFY_TIMEOUT_MS);
+    // True once the compositor answered and did not list our surfaces. Drives the
+    // same "alive but opened nothing" diagnosis Hyprland already had.
+    let mut ipc_ever_said_no = false;
+
+    loop {
+        thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
+
+        let pids = matching_pids(proc_root, matcher)?;
+        let alive = !pids.is_empty();
+        let log_contents = fs::read_to_string(log_file).unwrap_or_default();
+
+        if !alive {
+            return Ok(VerifyResult::Dead {
+                log_tail: tail_lines_or_placeholder(&log_contents, &label),
+            });
+        }
+        // Not matching bare "ERROR:" — quickshell emits that for Qt deprecation
+        // notices and other non-fatal runtime errors.
+        if log_contents.contains("Failed to load configuration") {
+            return Ok(VerifyResult::Dead {
+                log_tail: tail_lines_or_placeholder(&log_contents, &label),
+            });
+        }
+        if let Some(probe) = ownership
+            && let Some(snapshot) = probe.compositor.layers()
+        {
+            let own = Ownership {
+                pids: &pids,
+                namespaces: probe.namespaces,
+                baseline: probe.baseline,
+            };
+            if crate::compositor::owns_layers(&snapshot, &own) {
+                return Ok(VerifyResult::Ok);
+            }
+            ipc_ever_said_no = true;
+        }
+
+        if Instant::now() >= deadline {
+            // Re-check liveness: `alive` above is up to VERIFY_POLL_MS stale.
+            if matching_pids(proc_root, matcher)?.is_empty() {
+                return Ok(VerifyResult::Dead {
+                    log_tail: tail_lines_or_placeholder(&log_contents, &label),
+                });
+            }
+            if ipc_ever_said_no {
+                let base_tail = tail_lines_or_placeholder(&log_contents, &label);
+                return Ok(VerifyResult::Dead {
+                    log_tail: format!(
+                        "{base_tail}\n<rice-cooker: shell alive + log-clean but created 0 matching \
+                         layer-shell surfaces in {VERIFY_TIMEOUT_MS}ms — likely a missing runtime \
+                         dep (wallpaper path, dbus service, specific env) or a namespace the \
+                         catalog does not declare>"
+                    ),
+                });
+            }
+            // No ownership probe, or the compositor never answered: alive +
+            // log-clean is the best available verdict.
+            return Ok(VerifyResult::Ok);
+        }
+    }
+}
+
 pub fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -337,7 +458,7 @@ struct ProcEntry {
     exe: Option<PathBuf>,
 }
 
-fn proc_pids(proc_root: &Path) -> Result<Vec<i32>> {
+fn proc_pids(proc_root: &Path) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -347,14 +468,14 @@ fn proc_pids(proc_root: &Path) -> Result<Vec<i32>> {
     };
     for entry in entries {
         let Ok(entry) = entry else { continue };
-        if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() {
+        if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
             out.push(pid);
         }
     }
     Ok(out)
 }
 
-fn read_proc_entry(proc_root: &Path, pid: i32) -> Result<Option<ProcEntry>> {
+fn read_proc_entry(proc_root: &Path, pid: u32) -> Result<Option<ProcEntry>> {
     // Skip races (process exited) and other users' entries (hidepid). Any other
     // error propagates — silently dropping it would mis-record our own
     // unreadable shell as "nothing was running".
@@ -380,6 +501,30 @@ fn read_proc_entry(proc_root: &Path, pid: i32) -> Result<Option<ProcEntry>> {
         cwd: fs::read_link(dir.join("cwd")).ok(),
         exe: fs::read_link(dir.join("exe")).ok(),
     }))
+}
+
+/// Names of the running processes that match, deduplicated and sorted.
+///
+/// `matching_pids` answers "is any of these running"; this answers "which", so a
+/// caller can report a conflict by name instead of just failing.
+pub fn running_shell_names(proc_root: &Path, matcher: &ShellMatcher) -> Result<Vec<String>> {
+    let mut found: Vec<String> = Vec::new();
+    for pid in proc_pids(proc_root)? {
+        let Some(entry) = read_proc_entry(proc_root, pid)? else {
+            continue;
+        };
+        let name = entry
+            .cmdline
+            .first()
+            .map(|a| normalize_shell_name(a))
+            .or_else(|| entry.exe.as_deref().map(|e| normalize_shell_name(&e.to_string_lossy())))
+            .unwrap_or_default();
+        if matcher.matches(&entry.cmdline, entry.exe.as_deref()) && !found.contains(&name) {
+            found.push(name);
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// The first running shell matching `matcher`, for capture-before-install.
@@ -693,5 +838,87 @@ mod tests {
         assert!(matching_pids(t.path(), &ShellMatcher::default())
             .unwrap()
             .is_empty());
+    }
+
+    // ── verify_argv (the Nix path) ───────────────────────────────────────────
+
+    #[test]
+    fn verify_argv_reports_dead_when_nothing_matches() {
+        let proc = fixture_proc(vec![proc!(1, ["waybar"], None)]);
+        let log = tempfile::tempdir().unwrap();
+        let log_file = log.path().join("last-run.log");
+        fs::write(&log_file, "INFO: booting\n").unwrap();
+        let matcher = ShellMatcher::new(["caelestia-shell"]);
+        let result = verify_argv(&matcher, proc.path(), &log_file, None).unwrap();
+        assert!(matches!(result, VerifyResult::Dead { .. }), "got {result:?}");
+    }
+
+    #[test]
+    fn verify_argv_reports_dead_on_a_config_load_failure() {
+        // A live process whose log shows the shell failed to load its config must
+        // not be reported healthy, even though the pid is present.
+        let proc = fixture_proc(vec![proc!(
+            7,
+            ["/nix/store/x/bin/caelestia-shell"],
+            None
+        )]);
+        let log = tempfile::tempdir().unwrap();
+        let log_file = log.path().join("last-run.log");
+        fs::write(&log_file, "Failed to load configuration\n").unwrap();
+        let matcher = ShellMatcher::new(["caelestia-shell"]);
+        let result = verify_argv(&matcher, proc.path(), &log_file, None).unwrap();
+        match result {
+            VerifyResult::Dead { log_tail } => {
+                assert!(log_tail.contains("Failed to load configuration"), "{log_tail}");
+            }
+            VerifyResult::Ok => panic!("a load failure must not verify as healthy"),
+        }
+    }
+
+    #[test]
+    fn running_shell_names_reports_which_ones_match() {
+        let proc = fixture_proc(vec![
+            proc!(1, ["waybar"], None),
+            proc!(2, ["/usr/bin/eww"], None),
+            proc!(3, ["kitty"], None),
+        ]);
+        let matcher = ShellMatcher::new(["waybar", "eww"]);
+        assert_eq!(
+            running_shell_names(proc.path(), &matcher).unwrap(),
+            vec!["eww".to_string(), "waybar".to_string()]
+        );
+    }
+
+    #[test]
+    fn running_shell_names_is_empty_when_nothing_matches() {
+        let proc = fixture_proc(vec![proc!(1, ["kitty"], None)]);
+        let matcher = ShellMatcher::new(["waybar"]);
+        assert!(running_shell_names(proc.path(), &matcher).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shell_matcher_label_is_readable() {
+        assert_eq!(ShellMatcher::new(["qs", "noctalia"]).label(), "qs|noctalia");
+    }
+
+    #[test]
+    fn session_reports_its_compositor_id() {
+        use crate::compositor::CompositorId;
+        let s = Session {
+            runtime_dir: PathBuf::from("/run/user/1000"),
+            wayland_display: Some("wayland-1".into()),
+            compositor: Compositor::Niri {
+                socket: PathBuf::from("/run/user/1000/niri.wayland-1.9.sock"),
+            },
+            env: SessionEnv {
+                runtime_dir: PathBuf::from("/run/user/1000"),
+                wayland_display: Some("wayland-1".into()),
+                hyprland_signature: None,
+                niri_socket: None,
+                current_desktop: Some("niri".into()),
+                proc_root: PathBuf::from("/proc"),
+            },
+        };
+        assert_eq!(s.compositor_id(), CompositorId::Niri);
     }
 }

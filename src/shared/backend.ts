@@ -30,4 +30,11 @@ export interface BackendRunResult {
 export interface EnvironmentCheckResult {
   supported: boolean;
   conflictingShells: string[];
+  /** Which package manager backs `install`: Arch packages, or Nix flakes. */
+  platform: 'arch' | 'nix' | null;
+  /** Detected compositor, or null when detection failed. */
+  compositor: 'hyprland' | 'niri' | null;
+  sessionType: string | null;
+  /** Why `supported` is false, most actionable first. */
+  reasons: string[];
 }

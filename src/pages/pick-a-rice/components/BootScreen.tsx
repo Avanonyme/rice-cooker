@@ -78,7 +78,7 @@ function getPointerStyle(item: BootItem, side: 'top' | 'bottom'): CSSProperties 
 
 export function BootScreen({
   active,
-  description = 'Rice Cooker is only built for arch + hyprland + quickshell.',
+  description = 'Rice Cooker needs a supported Wayland session (Hyprland or niri).',
   wideDescription = false,
   onActiveChange,
   onApply,

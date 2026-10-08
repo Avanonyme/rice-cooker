@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, screen, shell, type WebContents } from 'electron';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { accessSync, constants, createWriteStream, existsSync, mkdirSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -18,7 +18,6 @@ const execFileAsync = promisify(execFile);
 const APP_CLASS_PATTERN = /^(electron|Electron|rice-cooker)$/;
 const APP_TITLE = 'Rice Cooker';
 const APP_ICON_FILE = 'rice-cooker.png';
-const CONFLICTING_SHELLS = ['waybar', 'ags', 'astal', 'eww', 'yambar'] as const;
 const HYPRLAND_WINDOW_EFFECTS = [
   ['no_blur', 'on'],
   ['no_shadow', 'on'],
@@ -82,43 +81,29 @@ const RAW_TAIL_LIMIT = 100;
 let activeBackendChild: ChildProcessWithoutNullStreams | null = null;
 let backendRunLogInitialized = false;
 
-function executableInPath(name: string): boolean {
-  for (const dir of (process.env['PATH'] ?? '').split(':')) {
-    if (!dir) continue;
-    try {
-      accessSync(join(dir, name), constants.X_OK);
-      return true;
-    } catch {}
-  }
-  return false;
-}
-
-async function processRunning(name: string): Promise<boolean> {
-  try {
-    await execFileAsync('pgrep', ['-x', name], { maxBuffer: 1024 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
+/**
+ * Ask the backend.
+ *
+ * Detection lives there so the GUI cannot disagree with the install engine about
+ * the platform, the compositor, or which shells are in the way. Duplicating it
+ * here is what made the boot screen Hyprland-and-Arch-only.
+ */
 async function environmentCheck(): Promise<EnvironmentCheckResult> {
-  const isHyprland = Boolean(process.env['HYPRLAND_INSTANCE_SIGNATURE']);
-  const conflictingShells = isHyprland
-    ? (await Promise.all(
-        CONFLICTING_SHELLS.map(async (name) => ((await processRunning(name)) ? name : null)),
-      )).filter((name): name is (typeof CONFLICTING_SHELLS)[number] => name !== null)
-    : [];
-
-  return {
-    supported:
-      existsSync('/etc/arch-release') &&
-      process.env['XDG_SESSION_TYPE'] === 'wayland' &&
-      isHyprland &&
-      executableInPath('quickshell') &&
-      conflictingShells.length === 0,
-    conflictingShells,
-  };
+  try {
+    const { stdout } = await execFileAsync(backendBin(), [...backendBaseArgs(), 'env'], {
+      maxBuffer: 1024 * 1024,
+    });
+    return JSON.parse(stdout) as EnvironmentCheckResult;
+  } catch (err) {
+    return {
+      supported: false,
+      conflictingShells: [],
+      platform: null,
+      compositor: null,
+      sessionType: null,
+      reasons: [`the rice-cooker backend could not report its environment: ${String(err)}`],
+    };
+  }
 }
 
 function backendBin(): string {

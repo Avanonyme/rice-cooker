@@ -202,6 +202,18 @@ impl RiceEntry {
         self.nix.is_some()
     }
 
+    /// Whether `install` can do anything meaningful here.
+    ///
+    /// Arch: there must be dependency work to do (upstream PR #16's rule). Nix:
+    /// there must be a `[nix]` block, because on a declarative system `install`
+    /// means emitting the configuration to adopt rather than mutating state.
+    pub fn install_is_supported(&self, platform: crate::platform::PlatformId) -> bool {
+        match platform {
+            crate::platform::PlatformId::Arch => !self.install_deps.is_empty(),
+            crate::platform::PlatformId::Nix => self.nix.is_some(),
+        }
+    }
+
     pub fn supports(&self, id: CompositorId) -> bool {
         self.compositors.contains(&id)
     }

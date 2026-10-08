@@ -95,3 +95,28 @@ commit = "c24bda36581fe7a34c692f2798a9296dcfca6f93"
 symlink_src = "dotfiles/.config/quickshell/nandoroid"
 symlink_dst = "~/.config/quickshell/nandoroid"
 preview_deps = ["ttf-material-symbols-variable"]
+
+# ── nix rices ─────────────────────────────────────────────────────────────────
+# `commit` must be a full 40-character revision here: a short SHA resolves
+# non-deterministically as the log grows, and the validator rejects it.
+# `[nix]` decides how the rice is realized; `[launch]` how it is started and
+# verified.
+
+[niri-caelestia]
+display_name = "Niri Caelestia"
+creator_name = "jutraim"
+repo = "https://github.com/jutraim/niri-caelestia-shell"
+commit = "fe36491a77c56ac51d6cad1c6fc05f9828fad837"
+compositors = ["niri"]
+# Measured on a live niri session: the shell names every surface
+# `caelestia-<name>` (background, drawers, border-exclusion).
+layer_namespaces = ["^caelestia-"]
+
+[niri-caelestia.launch]
+kind = "argv"
+argv = ["caelestia-shell"]
+
+[niri-caelestia.nix]
+shape = "package"
+package = "default"
+flake = "github:jutraim/niri-caelestia-shell/fe36491a77c56ac51d6cad1c6fc05f9828fad837"

@@ -503,13 +503,16 @@ fn run_activate<W: Write>(
     };
     match verify_result {
         VerifyResult::Ok => step(events, Step::Verify, StepState::Done)?,
-        VerifyResult::Dead { log_tail } => {
+        VerifyResult::Dead { reason, log_tail } => {
+            // `reason` distinguishes "the process is gone" from "the compositor
+            // listed none of its surfaces" and "its config failed to load", which
+            // the old hardcoded `qs_exited` conflated into one misleading slug.
             return fail_and_rollback_activation(
                 paths,
                 events,
                 name,
                 "verify",
-                "qs_exited",
+                reason,
                 Some(log_tail),
             );
         }

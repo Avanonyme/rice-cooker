@@ -292,7 +292,12 @@ pub fn launch_argv(argv: &[String], cwd: &Path, log_file: &Path) -> Result<()> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VerifyResult {
     Ok,
-    Dead { log_tail: String },
+    /// `reason` is a stable machine-readable slug for the event stream; the
+    /// message itself is not, and is not meant to be parsed.
+    Dead {
+        reason: &'static str,
+        log_tail: String,
+    },
 }
 
 pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
@@ -309,6 +314,7 @@ pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
 
         if !alive {
             return Ok(VerifyResult::Dead {
+                reason: "qs_exited",
                 log_tail: tail_lines_or_placeholder(&log_contents, name),
             });
         }
@@ -316,6 +322,7 @@ pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
         // notices and other non-fatal runtime errors.
         if log_contents.contains("Failed to load configuration") {
             return Ok(VerifyResult::Dead {
+                reason: "config_load_failed",
                 log_tail: tail_lines_or_placeholder(&log_contents, name),
             });
         }
@@ -329,6 +336,7 @@ pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
             // Re-check liveness: `alive` above is up to VERIFY_POLL_MS stale.
             if pgrep(&["-xf", &pat])?.is_empty() {
                 return Ok(VerifyResult::Dead {
+                    reason: "qs_exited",
                     log_tail: tail_lines_or_placeholder(&log_contents, name),
                 });
             }
@@ -337,6 +345,7 @@ pub fn verify_by_name(name: &str, log_file: &Path) -> Result<VerifyResult> {
             if hypr_ever_said_no {
                 let base_tail = tail_lines_or_placeholder(&log_contents, name);
                 return Ok(VerifyResult::Dead {
+                    reason: "no_layer_surface",
                     log_tail: format!(
                         "{base_tail}\n<rice-cooker: shell alive + log-clean but created 0 layer-shell surfaces in {VERIFY_TIMEOUT_MS}ms — likely a missing runtime dep (wallpaper path, dbus service, specific env)>"
                     ),
@@ -374,63 +383,80 @@ pub fn verify_argv(
 ) -> Result<VerifyResult> {
     let label = matcher.label();
     let deadline = Instant::now() + Duration::from_millis(VERIFY_TIMEOUT_MS);
-    // True once the compositor answered and did not list our surfaces. Drives the
-    // same "alive but opened nothing" diagnosis Hyprland already had.
-    let mut ipc_ever_said_no = false;
+    // True once the compositor answered. Distinguishes "the compositor says the
+    // shell opened nothing" from "we could not ask".
+    let mut compositor_answered = false;
 
     loop {
         thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
 
+        // The deadline check below is in the same iteration, so this is the
+        // freshest sample and needs no carry-over.
         let pids = matching_pids(proc_root, matcher)?;
-        let alive = !pids.is_empty();
         let log_contents = fs::read_to_string(log_file).unwrap_or_default();
 
-        if !alive {
-            return Ok(VerifyResult::Dead {
-                log_tail: tail_lines_or_placeholder(&log_contents, &label),
-            });
-        }
         // Not matching bare "ERROR:" — quickshell emits that for Qt deprecation
         // notices and other non-fatal runtime errors.
         if log_contents.contains("Failed to load configuration") {
             return Ok(VerifyResult::Dead {
+                reason: "config_load_failed",
                 log_tail: tail_lines_or_placeholder(&log_contents, &label),
             });
         }
-        if let Some(probe) = ownership
-            && let Some(snapshot) = probe.compositor.layers()
-        {
-            let own = Ownership {
-                pids: &pids,
-                namespaces: probe.namespaces,
-                baseline: probe.baseline,
-            };
-            if crate::compositor::owns_layers(&snapshot, &own) {
+
+        match ownership {
+            // Layer ownership is the primary signal. A surface that appeared since
+            // the baseline cannot be produced without the shell having loaded its
+            // QML, and it does not depend on finding a pid — which is fragile for a
+            // store path behind a `makeBinaryWrapper` wrapper, and impossible on
+            // niri, which reports no pid at all.
+            Some(probe) => {
+                if let Some(snapshot) = probe.compositor.layers() {
+                    compositor_answered = true;
+                    let own = Ownership {
+                        pids: &pids,
+                        namespaces: probe.namespaces,
+                        baseline: probe.baseline,
+                    };
+                    if crate::compositor::owns_layers(&snapshot, &own) {
+                        return Ok(VerifyResult::Ok);
+                    }
+                }
+            }
+            // No probe to ask, so liveness is all there is.
+            None => {
+                if pids.is_empty() {
+                    return Ok(VerifyResult::Dead {
+                        reason: "qs_exited",
+                        log_tail: tail_lines_or_placeholder(&log_contents, &label),
+                    });
+                }
                 return Ok(VerifyResult::Ok);
             }
-            ipc_ever_said_no = true;
         }
 
         if Instant::now() >= deadline {
-            // Re-check liveness: `alive` above is up to VERIFY_POLL_MS stale.
-            if matching_pids(proc_root, matcher)?.is_empty() {
+            let base_tail = tail_lines_or_placeholder(&log_contents, &label);
+            if compositor_answered {
                 return Ok(VerifyResult::Dead {
-                    log_tail: tail_lines_or_placeholder(&log_contents, &label),
-                });
-            }
-            if ipc_ever_said_no {
-                let base_tail = tail_lines_or_placeholder(&log_contents, &label);
-                return Ok(VerifyResult::Dead {
+                    reason: "no_layer_surface",
                     log_tail: format!(
-                        "{base_tail}\n<rice-cooker: shell alive + log-clean but created 0 matching \
-                         layer-shell surfaces in {VERIFY_TIMEOUT_MS}ms — likely a missing runtime \
-                         dep (wallpaper path, dbus service, specific env) or a namespace the \
-                         catalog does not declare>"
+                        "{base_tail}\n<rice-cooker: the compositor listed no layer surface matching \
+                         the declared namespaces within {VERIFY_TIMEOUT_MS}ms. Matched pids for \
+                         {label}: {pids:?}. Either the catalog's layer_namespaces are wrong, or \
+                         the shell opened nothing — check the log above for a missing runtime dep>"
                     ),
                 });
             }
-            // No ownership probe, or the compositor never answered: alive +
-            // log-clean is the best available verdict.
+            if pids.is_empty() {
+                return Ok(VerifyResult::Dead {
+                    reason: "qs_exited",
+                    log_tail: format!(
+                        "{base_tail}\n<rice-cooker: nothing matching {label} in /proc, and the \
+                         compositor did not answer a layers() query either>"
+                    ),
+                });
+            }
             return Ok(VerifyResult::Ok);
         }
     }
@@ -884,7 +910,8 @@ mod tests {
         let matcher = ShellMatcher::new(["caelestia-shell"]);
         let result = verify_argv(&matcher, proc.path(), &log_file, None).unwrap();
         match result {
-            VerifyResult::Dead { log_tail } => {
+            VerifyResult::Dead { reason, log_tail } => {
+                assert_eq!(reason, "config_load_failed");
                 assert!(log_tail.contains("Failed to load configuration"), "{log_tail}");
             }
             VerifyResult::Ok => panic!("a load failure must not verify as healthy"),

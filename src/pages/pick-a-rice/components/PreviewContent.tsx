@@ -10,6 +10,9 @@ interface PreviewContentProps {
   themeName: string;
   creatorName: string;
   installSupported: boolean;
+  /** Rices in the catalog that this compositor cannot run. */
+  hiddenCount: number;
+  hiddenReason?: string;
   onApply: () => void;
 }
 
@@ -28,6 +31,8 @@ export function PreviewContent({
   themeName,
   creatorName,
   installSupported,
+  hiddenCount,
+  hiddenReason,
   onApply,
 }: PreviewContentProps) {
   const view = useView();
@@ -43,6 +48,14 @@ export function PreviewContent({
       variants={SHRUNKEN_TEXT_VARIANTS}
       style={{ pointerEvents: active ? 'auto' : 'none' }}
     >
+      {hiddenCount > 0 ? (
+        // Loud rather than silent: a rice that cannot run here is hidden, and
+        // saying so beats an unexplained shorter list.
+        <p className={styles.hiddenNote}>
+          {hiddenCount} {hiddenCount === 1 ? 'rice' : 'rices'} hidden
+          {hiddenReason ? `: ${hiddenReason}` : ''}
+        </p>
+      ) : null}
       <p className={`${styles.navLabel} ${styles.prevLabel}`}>Prev</p>
       <p className={`${styles.navLabel} ${styles.nextLabel}`}>Next</p>
       <p className={`${styles.navLabel} ${styles.confirmLabel}`}>CONFIRM</p>

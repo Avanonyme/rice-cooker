@@ -5,6 +5,15 @@ export interface RiceListRow {
   repo: string;
   install_supported: boolean;
   installed: boolean;
+  /** Compositors this rice declares. */
+  compositors: Array<'hyprland' | 'niri'>;
+  /**
+   * Whether it can be used on the compositor this session is running. The
+   * backend decides, so the UI cannot disagree with the engine about it.
+   */
+  supported: boolean;
+  /** Why not, when `supported` is false. */
+  unsupported_reason?: string;
 }
 
 export type BackendCommand = 'preview' | 'install' | 'uninstall';

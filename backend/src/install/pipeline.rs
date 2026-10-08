@@ -42,6 +42,16 @@ pub struct ListRow {
     pub repo: String,
     pub install_supported: bool,
     pub installed: bool,
+    /// Compositors this rice declares. The UI discriminates on this rather than
+    /// offering a rice that cannot run here.
+    pub compositors: Vec<crate::compositor::CompositorId>,
+    /// Whether it can be used on the compositor `list` was given. True when the
+    /// compositor is unknown, because then there is nothing to contradict.
+    pub supported: bool,
+    /// Why not, when `supported` is false. Names the declared set so the reason is
+    /// actionable rather than a bare refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -208,10 +218,18 @@ fn run_activate<W: Write>(
             .map(|c| c.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        // Loud and specific: this is a refusal to try, not a failure to work. The
+        // message names both sides so it is clear whether the rice or the session
+        // is the problem, and `compositor_unsupported` is a distinct reason so the
+        // UI can say "not for your compositor" rather than showing a crash.
         emit_fail(
             events,
-            "preflight",
-            &format!("{name}: does not support {compositor_id} (declares {declared})"),
+            "compositor_unsupported",
+            &format!(
+                "{name} is built for {declared}, and this session is {compositor_id}. \
+                 Rice Cooker will not try it: `rice-cooker-backend compat {name}` reports \
+                 which compositor APIs its configuration actually uses."
+            ),
             None,
         )?;
         return Ok(false);
@@ -912,21 +930,44 @@ fn remove_rice_symlink(record: &InstallRecord) -> Result<()> {
         .with_context(|| format!("removing symlink {}", symlink_path.display()))
 }
 
-/// `platform` is a parameter rather than a hidden `detect()` call so the output
-/// is reproducible: on a machine that happens to have both `nix` and `pacman` on
-/// PATH, a hidden read would make this list environment-dependent.
-pub fn list(cat: &Catalog, paths: &Paths, platform: PlatformId) -> Result<Vec<ListRow>> {
+/// `platform` and `compositor` are parameters rather than hidden `detect()` calls
+/// so the output is reproducible: on a machine that happens to have both `nix` and
+/// `pacman` on PATH, a hidden read would make this list environment-dependent.
+pub fn list(
+    cat: &Catalog,
+    paths: &Paths,
+    platform: PlatformId,
+    compositor: Option<crate::compositor::CompositorId>,
+) -> Result<Vec<ListRow>> {
     let current = read_current(paths)?;
     Ok(cat
         .rices
         .iter()
-        .map(|(name, entry)| ListRow {
-            name: name.clone(),
-            display_name: entry.display_name.clone(),
-            creator_name: entry.creator_name.clone(),
-            repo: entry.repo.clone(),
-            install_supported: entry.install_is_supported(platform),
-            installed: current.as_deref() == Some(name.as_str()),
+        .map(|(name, entry)| {
+            let supported = compositor.is_none_or(|id| entry.supports(id));
+            let unsupported_reason = (!supported).then(|| {
+                let declared = entry
+                    .compositors
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "built for {declared}, not for {}",
+                    compositor.map(|c| c.as_str()).unwrap_or("this compositor")
+                )
+            });
+            ListRow {
+                name: name.clone(),
+                display_name: entry.display_name.clone(),
+                creator_name: entry.creator_name.clone(),
+                repo: entry.repo.clone(),
+                install_supported: entry.install_is_supported(platform),
+                installed: current.as_deref() == Some(name.as_str()),
+                compositors: entry.compositors.clone(),
+                supported,
+                unsupported_reason,
+            }
         })
         .collect())
 }
@@ -1504,6 +1545,51 @@ mod tests {
         let out = std::str::from_utf8(&buf).unwrap();
         assert!(out.contains(r#""stage":"preflight""#));
         assert!(out.contains("not in catalog"));
+    }
+
+    #[test]
+    fn list_discriminates_by_compositor() {
+        let (_t, paths) = tmp_paths();
+        let cat = Catalog::parse(
+            r#"
+            [niri_only]
+            display_name = "Niri only"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            symlink_src = "."
+            symlink_dst = "~/.config/quickshell/n"
+            compositors = ["niri"]
+            install_deps = ["pkg"]
+
+            [v1_default]
+            display_name = "V1"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            symlink_src = "."
+            symlink_dst = "~/.config/quickshell/v"
+            install_deps = ["pkg"]
+            "#,
+        )
+        .unwrap();
+
+        // On niri, the v1 default (hyprland-only) is refused with a reason.
+        let rows = list(&cat, &paths, PlatformId::Arch, Some(crate::compositor::CompositorId::Niri))
+            .unwrap();
+        let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap().clone();
+        assert!(by_name("niri_only").supported);
+        assert!(by_name("niri_only").unsupported_reason.is_none());
+        let v1 = by_name("v1_default");
+        assert!(!v1.supported);
+        assert_eq!(
+            v1.unsupported_reason.as_deref(),
+            Some("built for hyprland, not for niri")
+        );
+
+        // An unknown compositor contradicts nothing, so nothing is hidden.
+        let rows = list(&cat, &paths, PlatformId::Arch, None).unwrap();
+        assert!(rows.iter().all(|r| r.supported));
     }
 
     #[test]

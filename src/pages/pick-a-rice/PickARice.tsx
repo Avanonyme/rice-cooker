@@ -69,7 +69,6 @@ const cyclePreviewOption = (option: PreviewOption, delta: -1 | 1) => {
 export function PickARice() {
   const [view, setView] = useState<View>('picking');
   const [previewOption, setPreviewOption] = useState<PreviewOption>('install');
-  const [rices, setRices] = useState<RiceListRow[]>([]);
   const [backendRunning, setBackendRunning] = useState(false);
   const [downloadsComplete, setDownloadsComplete] = useState(false);
   const [focusedRiceIndex, setFocusedRiceIndex] = useState(0);
@@ -89,6 +88,10 @@ export function PickARice() {
   // Set when an install yields configuration instead of a running shell, which is
   // what every install does on a declarative platform.
   const [installConfig, setInstallConfig] = useState<InstallConfig | null>(null);
+  // Every row from the catalog, and the subset this compositor can run. The
+  // backend computes `supported`, so filtering on it cannot drift from what the
+  // install engine would accept.
+  const [allRices, setAllRices] = useState<RiceListRow[]>([]);
   const [failureActive, setFailureActive] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [pickerExiting, setPickerExiting] = useState(false);
@@ -131,7 +134,7 @@ export function PickARice() {
       .list()
       .then((rows) => {
         if (cancelled) return;
-        setRices(rows);
+        setAllRices(rows);
       })
       .catch((error: unknown) => {
         if (cancelled) return;
@@ -236,6 +239,9 @@ export function PickARice() {
     lastRiceSoundTargetRef.current = index;
     playRiceSound(sound);
   }, [rices.length]);
+
+  const rices = useMemo(() => allRices.filter((row) => row.supported), [allRices]);
+  const hiddenRices = useMemo(() => allRices.filter((row) => !row.supported), [allRices]);
 
   const configPanelOpen = installConfig !== null;
 
@@ -623,6 +629,8 @@ export function PickARice() {
                           themeName={selectedRice?.display_name ?? 'themename'}
                           creatorName={selectedRice?.creator_name ?? 'creatorname'}
                           installSupported={selectedRice?.install_supported ?? true}
+                          hiddenCount={hiddenRices.length}
+                          hiddenReason={hiddenRices[0]?.unsupported_reason}
                           onApply={applyFocusedRice}
                         />
                       )}

@@ -9,7 +9,11 @@ expression: stdout
     "creator_name": "author-one",
     "repo": "https://example.invalid/one",
     "install_supported": true,
-    "installed": false
+    "installed": false,
+    "compositors": [
+      "hyprland"
+    ],
+    "supported": true
   },
   {
     "name": "two",
@@ -17,6 +21,10 @@ expression: stdout
     "creator_name": "author-two",
     "repo": "https://example.invalid/two",
     "install_supported": false,
-    "installed": false
+    "installed": false,
+    "compositors": [
+      "hyprland"
+    ],
+    "supported": true
   }
 ]

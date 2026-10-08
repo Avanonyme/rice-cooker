@@ -16,6 +16,11 @@ repo = "https://github.com/noctalia-dev/noctalia-shell"
 commit = "d7b68652e79bce5813dc4fea7e51636a5da3e1b7"
 symlink_src = "."
 symlink_dst = "~/.config/quickshell/noctalia"
+compositors = ["hyprland", "niri"]
+# Measured shapes are unclear for this shell, so accept either: the shell's own
+# `noctalia-*` surfaces, or the plain quickshell namespace. Narrow it once
+# `niri msg layers` has been read on a live session.
+layer_namespaces = ["^noctalia-", "^quickshell"]
 install_deps = [
   "noctalia-shell",
   "cliphist",
@@ -26,6 +31,19 @@ install_deps = [
   "wtype"
 ]
 preview_deps = ["noctalia-qs"]
+
+# Nix side. noctalia's flake exposes `homeModules.default` and its own
+# `programs.noctalia`, so it is a `module` rice. Its Arch side (the symlink
+# above) is independent of this and still applies there.
+[noctalia.launch]
+kind = "argv"
+argv = ["noctalia"]
+
+[noctalia.nix]
+shape = "module"
+module = "homeModules.default"
+hm_option = "programs.noctalia.enable"
+flake = "github:noctalia-dev/noctalia-shell/d7b68652e79bce5813dc4fea7e51636a5da3e1b7"
 
 [linux-retroism]
 display_name = "linux-retroism"

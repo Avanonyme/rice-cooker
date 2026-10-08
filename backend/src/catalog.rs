@@ -383,9 +383,10 @@ fn validate_entry(name: &str, entry: &RiceEntry) -> Result<()> {
     validate_launch(name, entry)?;
     validate_nix(name, entry)?;
 
-    // symlink fields are applicable to Arch entries and to `dotfiles` rices.
-    // A `module` rice places its own config through the module, and a `package`
-    // rice has no config tree, so for those the fields would be a lie.
+    // The symlink fields are Arch-side data and the `[nix]` shape is Nix-side
+    // data: they are orthogonal, and a rice may need both. noctalia is exactly
+    // that — symlinked into `quickshell/` on Arch, imported as a module on Nix.
+    // Only `dotfiles` *requires* them, because that shape realizes by linking.
     let needs_symlink = match &entry.nix {
         None => true,
         Some(nix) => nix.shape == NixShape::Dotfiles,
@@ -393,12 +394,7 @@ fn validate_entry(name: &str, entry: &RiceEntry) -> Result<()> {
     match (&entry.symlink_src, &entry.symlink_dst) {
         (None, None) if !needs_symlink => {}
         (None, _) | (_, None) => bail!(
-            "{name}: symlink_src and symlink_dst must both be set (or both omitted for a \
-             nix.shape = \"module\"/\"package\" entry)"
-        ),
-        (Some(_), Some(_)) if !needs_symlink => bail!(
-            "{name}: symlink_src/symlink_dst are not applicable to nix.shape = {}",
-            shape_name(entry.nix.as_ref().expect("needs_symlink was false"))
+            "{name}: symlink_src and symlink_dst must both be set or both omitted"
         ),
         (Some(src), Some(dst)) => {
             validate_symlink_src(name, src)?;
@@ -407,14 +403,6 @@ fn validate_entry(name: &str, entry: &RiceEntry) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn shape_name(nix: &NixDecl) -> &'static str {
-    match nix.shape {
-        NixShape::Module => "module",
-        NixShape::Package => "package",
-        NixShape::Dotfiles => "dotfiles",
-    }
 }
 
 fn validate_symlink_src(name: &str, raw: &str) -> Result<()> {
@@ -843,7 +831,10 @@ mod tests {
     }
 
     #[test]
-    fn package_rice_may_not_declare_symlinks() {
+    fn arch_symlink_fields_are_orthogonal_to_the_nix_shape() {
+        // A rice can be symlinked into place on Arch *and* imported as a module
+        // on Nix. Refusing the combination would have excluded noctalia, which is
+        // exactly that, and whose Arch entry predates its Nix one.
         for shape in ["package", "module"] {
             let extra = if shape == "module" {
                 "module = \"homeModules.default\"\n"
@@ -864,10 +855,28 @@ mod tests {
                 {extra}
                 "#
             );
-            let err = Catalog::parse(&t).unwrap_err().to_string();
-            assert!(err.contains("not applicable"), "{shape}: got {err}");
-            assert!(err.contains(shape), "{shape}: error should name the shape, got {err}");
+            let c = Catalog::parse(&t).unwrap_or_else(|e| panic!("{shape}: {e:#}"));
+            let entry = c.get("p").unwrap();
+            assert!(entry.links_into_config(), "{shape}: the symlink must survive");
+            assert_eq!(entry.symlink(), Some((".", "~/.config/x")));
         }
+    }
+
+    #[test]
+    fn a_half_declared_symlink_pair_is_still_refused() {
+        let t = r#"
+            [p]
+            display_name = "P"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            symlink_src = "."
+            [p.nix]
+            shape = "module"
+            module = "homeModules.default"
+        "#;
+        let err = Catalog::parse(t).unwrap_err().to_string();
+        assert!(err.contains("both be set or both omitted"), "got: {err}");
     }
 
     #[test]

@@ -179,7 +179,20 @@
             src = ./backend;
             cargoLock.lockFile = ./backend/Cargo.lock;
             # `git` is required by the pipeline's preflight and by its tests.
-            nativeBuildInputs = [ pkgs.git ];
+            nativeBuildInputs = [
+              pkgs.git
+              pkgs.makeWrapper
+            ];
+            # Ship the catalog and add it to XDG_DATA_DIRS, which is the lookup
+            # `Paths::find_catalog` already implements. Without this the CLI has
+            # no catalog at all: `nix run .#backend` failed with "no catalog
+            # found" while the GUI worked, because only the GUI wrapper set
+            # RICE_COOKER_CATALOG.
+            postInstall = ''
+              install -Dm644 ${./backend/catalog.toml} $out/share/rice-cooker/catalog.toml
+              wrapProgram $out/bin/rice-cooker-backend \
+                --prefix XDG_DATA_DIRS : $out/share
+            '';
             meta = {
               description = "rice-cooker install engine";
               license = lib.licenses.bsd3;

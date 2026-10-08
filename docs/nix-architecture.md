@@ -1,435 +1,284 @@
-# Nix-first architecture for rice-cooker (with niri as a first-class compositor)
+# rice-cooker: Nix-first architecture, with niri as a first-class compositor
 
-Design + diff spec. Companion to `nix-recon-digest.md`, which holds the verified
-reconnaissance this is built on.
+Companion to `nix-recon-digest.md`, which holds the verified reconnaissance. This
+document describes **what the code does now**. Anything not yet built is in
+§9 and labelled as such.
 
-Status of this branch: the **catalog v2 seam**, the **compositor seam** (including
-niri) and the **shell-identity fix** are implemented and tested. The platform seam,
-Nix activation, and the Electron/UI/Den changes are specified below but not yet
-written.
+Two corrections to earlier revisions of this file, both disproven by
+measurement rather than by argument:
 
----
-
-## 0. Two decisions that drive everything
-
-**D1 — Nix does the fetching.** On the Nix platform each rice repo becomes a flake
-input of a generated state flake, pinned by `rev` and locked by `narHash`. There is
-no `git clone` at runtime, so `git.rs`, `install/symlink.rs` and the clone cache stay
-Arch-only. This resolves the purity conflict: a store path can feed
-`xdg.configFile.source` directly, and the lock file is the pin that the old
-`commit = "..."` field used to be.
-
-**D2 — activation goes through a *standalone* Home Manager, never the NixOS module.**
-`home-manager switch --specialisation NAME` exists from HM 25.11 and is verified by
-HM's own `tests/integration/standalone/specialisation.nix`. The NixOS-module path
-activates through `${system.build.toplevel}/specialisation/<n>/activate`, and that
-toplevel only changes on a system rebuild. Worse, on this desktop
-(`modules/aspects/users/avanonyme.nix` sets `useGlobalPkgs` + `useUserPackages`) the
-boot service `home-manager-<user>.service` re-activates the *system-pinned*
-generation, so a rice activated out of band is silently reverted at the next boot or
-`nixos-rebuild`. Standalone HM is therefore the only design that satisfies
-"no system rebuild" durably.
+- **Home Manager specialisations are not the activation mechanism.** The whole
+  `--specialisation` design is gone. Details in §3.
+- **`layer_namespaces` is not `^quickshell:`.** The live shell declares
+  `caelestia-*`. Details in §6.
 
 ---
 
-## 1. Compositor seam — IMPLEMENTED
+## 1. Two modes, and why they are not the same thing
 
-`backend/src/compositor/{mod,hyprland,niri}.rs`
+`rice-cooker`'s workflow is `preview` and `install`, with `revert`/`uninstall` as
+undo. On Nix those necessarily diverge, because a tool cannot mutate a
+declarative system.
 
-```rust
-pub enum CompositorId { Hyprland, Niri }              // serde: "hyprland" | "niri"
-pub enum Compositor { Hyprland { signature: String }, Niri { socket: PathBuf } }
+| | Arch | Nix |
+| --- | --- | --- |
+| `preview` | clone → `paru -S` deps → symlink → launch → verify | **build the flake → launch from the store → verify** |
+| `install` | the above, recorded, persistent | **emit adoptable configuration**; nothing is mutated |
+| `install_supported` | `install_deps` is non-empty (PR #16) | a `[nix]` block exists |
+| undo | remove symlink, `pacman -Rns`, replay argv | replay argv (preview); delete the emitted file (install) |
 
-impl Compositor {
-    pub fn detect(env: &SessionEnv) -> Result<Self>;
-    pub fn id(&self) -> CompositorId;
-    /// None = IPC failed or timed out. Never "zero surfaces".
-    pub fn layers(&self) -> Option<Vec<LayerSurface>>;
-}
+**Choosing a compositor is rebuild-scoped; choosing a shell is not.** That is the
+line the design draws. `programs.rice-cooker.compositor` belongs in Nix precisely
+because you do not hot-swap a window manager, whereas `shell` must stay
+rebuild-free — which is why install *emits* rather than applies.
 
-pub struct LayerSurface { namespace, output, layer, pid: Option<u32> }
+## 2. What is proven, and how
 
-/// Pure, unit-testable ownership decision.
-pub fn owns_layers(snapshot: &[LayerSurface], o: &Ownership<'_>) -> bool;
-pub fn compile_namespaces(id: CompositorId, declared: &[String]) -> Result<Vec<Regex>>;
+Everything below was measured on boreal (NixOS, niri 26.04, graphical session
+owned by user `gamer`), not inferred.
+
+| Claim | Evidence |
+| --- | --- |
+| A Nix-packaged shell launches from a store path with **no symlink** | `-p` resolved to `$out/share/caelestia-shell/shell.qml`; `Configuration Loaded` |
+| The niri adaptation works | `NiriService: niri found, starting event stream`, then workspaces `{"1":…,"2":…}`, focused window, outputs `[HDMI-A-1]` |
+| Layer namespaces | `caelestia-background`, `caelestia-drawers`, 4× `caelestia-border-exclusion` |
+| Eviction is mandatory | `Could not register notification server … already registered` while noctalia ran |
+| The build is cheap | 8 derivations, 719 MiB fetched; the GUI adds only `electron_42` |
+
+## 3. Nix preview: build, launch, verify
+
+Activation **never touches Home Manager**, so it needs no standalone profile, no
+`home-manager` CLI, and no system rebuild. Every risk the earlier
+specialisation-based plan carried — two HM instances, duplicate imports, stale
+locks, GC'd generations, read-only store configs — is gone.
+
+`backend/src/install/pipeline.rs` branches on `platform == Nix`:
+
+| Stage | Nix implementation | Arch unchanged |
+| --- | --- | --- |
+| `deps` | `nix build --no-link --print-out-paths <flake>#<attr>` (`platform::build_store_path`) | `paru`/`yay` |
+| `symlink` | **skipped** — a Nix shell is a wrapper carrying its own config path | symlink into `$XDG_CONFIG_HOME` |
+| `record` | `InstallRecord.nix = { store_path, launch_argv, snippet_path }` | `pacman_diff` |
+| `evict` / `kill` | `kill_quickshell_with([…])` matching the rice's own argv0 | same |
+| `launch` | `LaunchSpec::Argv`, resolved as `<store>/bin/<bin>` | `quickshell -c <name>` |
+| `verify` | `verify_argv` + `owns_layers` | `verify_by_name` + Hyprland pid |
+| revert | `replay_original_shell` with the captured argv | same |
+
+Three details that matter:
+
+- **Step names `deps` / `launch` / `verify` are a UI contract.**
+  `src/pages/pick-a-rice/PickARice.tsx` drives its progress from them.
+- **A bare binary resolves against the store.** `argv = ["caelestia-shell"]`
+  becomes `<store>/bin/caelestia-shell`, so the shell's *own wrapper* runs rather
+  than whatever `quickshell` is on `PATH`. Checked as `<store>/bin/<name>` first;
+  falls back untouched when absent, which is how `noctalia` still resolves.
+- **Eviction must match the outgoing rice's argv0.** `caelestia-shell` is not
+  `quickshell`, so the default matcher left a previously previewed shell running
+  and two shells fought for the same surfaces.
+
+`process::verify_argv` distinguishes three outcomes, in this order: gone
+(`!alive`), log carries `Failed to load configuration`, or the layer snapshot
+shows one of our surfaces since the baseline. The last one is what proves the QML
+actually evaluated, because the namespace is built at runtime as
+`caelestia-${name}` — matching its prefix cannot be faked by a process that merely
+started.
+
+## 4. The install contract
+
+The flake ships the module; the user writes a few lines and imports the rice
+module themselves.
+
+```nix
+imports = [
+  rice-cooker.homeManagerModules.default
+  inputs.niri-caelestia.homeManagerModules.default
+];
+
+programs.rice-cooker = {
+  enable = true;
+  shell = "niri-caelestia";
+  rices.niri-caelestia = inputs.niri-caelestia;
+};
 ```
 
-Three differences are hidden behind it:
+`nix/hm-module.nix` **selects, launches and asserts**. It does not import the
+rice's module, because a module cannot choose its imports from configuration
+values — that is either invalid or infinite recursion. It verifies the import
+instead, via `options` and the catalog's `nix.hm_option`
+(`programs.caelestia.enable`), and its assertion message states the remedy.
+
+Existence checks read `options`, never `config`. Deciding what to define by
+reading what is defined is the same trap.
+
+`enable` forces the shell by registering `rice-cooker-shell.service` with
+`ExecStart` under `mkForce`, and reports the conflict as a *warning* when another
+known shell is also enabled — the user's own configuration owns its startup
+items, so the module cannot delete them.
+
+`install` on Nix writes `$XDG_DATA_HOME/rice-cooker/install-snippets/<rice>.nix`
+and prints the same lines. The snippet includes the `imports` line *and* the
+`rices.<name>` line, because without them it would fail the module's own
+assertion.
+
+## 5. Catalog v2
+
+`[_catalog].schema = 2`, and every added field is defaulted, so the eight v1
+entries parse unchanged with `compositors` defaulting to `["hyprland"]` — exactly
+the v1 assumption.
+
+```toml
+[niri-caelestia]
+repo = "https://github.com/jutraim/niri-caelestia-shell"
+commit = "fe36491a77c56ac51d6cad1c6fc05f9828fad837"   # 40-hex or a ref; never a short SHA
+compositors = ["niri"]
+layer_namespaces = ["^caelestia-"]
+
+[niri-caelestia.launch]
+kind = "argv"
+argv = ["caelestia-shell"]
+
+[niri-caelestia.nix]
+shape = "package"
+package = "default"
+flake = "github:jutraim/niri-caelestia-shell/fe36491a…"
+hm_option = "programs.caelestia.enable"
+```
+
+Three rice shapes, dispatched rather than assumed: `module`
+(`homeManagerModules.*` — ChromaShell, noctalia), `package`
+(`packages.<system>.*` plus a launch command — amane, niri-caelestia), and
+`dotfiles` (a re-exported tree).
+
+Two parse modes: `Catalog::parse` is strict and gates CI and the bundled catalog;
+`parse_lenient` skips one bad entry so a runtime-fetched catalog cannot be broken
+by a field this binary does not know. This is needed because
+`#[serde(flatten)]` makes the top-level table *the entry map*, so `_catalog` has
+to be lifted out before deserialising.
+
+Validation is the only channel from catalog data into generated Nix, so it is
+strict: attr paths are dotted `[A-Za-z0-9_-]` segments, flake refs reject
+`"`, `'`, `;`, `$`, `` ` `` and newlines, and a short SHA is refused for Nix
+entries because it resolves non-deterministically as the log grows.
+
+## 6. Compositor seam
+
+`backend/src/compositor/{mod,hyprland,niri}.rs`:
+
+```rust
+pub enum Compositor { Hyprland { signature: String }, Niri { socket: PathBuf } }
+impl Compositor {
+    pub fn detect(env: &SessionEnv) -> Result<Self>;
+    pub fn layers(&self) -> Option<Vec<LayerSurface>>;   // None = IPC failed
+}
+pub fn owns_layers(snapshot: &[LayerSurface], o: &Ownership<'_>) -> bool;
+```
 
 | | Hyprland | niri |
 | --- | --- | --- |
-| detection | `HYPRLAND_INSTANCE_SIGNATURE` + `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock` must exist | `$NIRI_SOCKET`, else reconstruct `niri.<WAYLAND_DISPLAY>.<pid>.sock` |
+| detection | `HYPRLAND_INSTANCE_SIGNATURE` + the instance socket existing | `$NIRI_SOCKET`, else `niri.<WAYLAND_DISPLAY>.<pid>.sock` reconstructed from `/proc` |
 | layer query | `hyprctl layers -j` | `"Layers"` over the UNIX socket |
-| ownership evidence | `pid` per surface | **namespace only — there is no pid** |
+| ownership evidence | `pid` per surface | **namespace only — niri reports no pid** |
 
-**Why this shape.** `SessionEnv` is injected rather than read from `std::env` at the
-call site, so the whole detection path is testable without touching process globals —
-including the fixture procfs. `layers()` returns `Option`, because a failed IPC query
-is not evidence that the shell opened no layers; collapsing the two would make a
-wedged compositor look like a failed launch.
+- Socket filename confirmed in niri's `IpcServer::start` and observed live as
+  `/run/user/1002/niri.wayland-1.2565.sock`.
+- `$NIRI_SOCKET` is unreliable (niri#2149), so a stale value falls back to
+  reconstruction, and a niri session with no reachable socket produces an
+  actionable error rather than "unsupported compositor".
+- Requests go over the socket directly instead of via `niri msg`, and are parsed
+  through `serde_json::Value`, so a *newer* compositor cannot break a working
+  desktop with an unknown field.
+- `layers()` returns `Option` because a failed IPC query is not evidence of zero
+  surfaces; collapsing the two would make a wedged compositor look like a failed
+  launch.
+- Ownership is *appeared since the baseline* **and** (*pid or namespace*). The
+  baseline is taken after eviction and before launch, and the diff is a
+  **multiset** on `(namespace, output, layer)` — the four identical
+  `caelestia-border-exclusion` surfaces are why a set diff would be wrong.
 
-**The niri no-pid problem, solved.** Ownership is *appeared since the baseline* AND
-(*pid matches* OR *namespace matches*). The baseline is a `layers()` snapshot taken
-after `KillQuickshell` and before `Launch`. On Hyprland the pid half still carries;
-on niri only the namespace half can fire, which is why `compile_namespaces` supplies
-`^quickshell` when a rice declares nothing and the compositor is niri. The baseline
-diff is a **multiset** on `(namespace, output, layer)`, not a set: otherwise a
-surviving surface from the shell just evicted would be read as the new one coming up.
+## 7. Shell identity
 
-**Anti-skew.** Requests go over the socket directly instead of via `niri msg`, and
-are parsed through `serde_json::Value` rather than typed structs. `niri msg` refuses
-to talk to a compositor older than itself, and `deny_unknown_fields` would turn a
-*newer* compositor into a hard failure on a working desktop.
+The single most damaging bug for this desktop: the running shell is `noctalia`,
+and every lookup matched `quickshell|qs` only, so the original shell was never
+captured, evicted or replayed. `pkill -x` was also structurally wrong — it
+matches `comm`, truncated to 15 characters, so `.quickshell-wrapped` and
+store-path argv0 binaries never matched.
 
-**Verified against niri source.** The socket filename is
-`format!("niri.{wayland_socket_name}.{}.sock", process::id())` in
-`niri/src/ipc/server.rs::IpcServer::start`. The recon digest's original
-`niri-*.sock` glob was wrong and has been corrected.
+`ShellMatcher` plus `normalize_shell_name` (basename, strip a leading `.`, strip
+`-wrapped`) now cover `quickshell`, `qs`, `noctalia-qs`, `noctalia`, and any
+catalog launch binary, matched against argv0 *or* the resolved executable. Pids
+come from procfs and are signalled by pid, with `proc_root` injectable for tests.
 
-## 2. Shell identity — IMPLEMENTED
+## 8. Verifying that a shell is compatible with a compositor
 
-`backend/src/process.rs`
+Four tiers, weakest to strongest:
 
-The single most damaging bug for this desktop: the running shell here is `noctalia`
-(`modules/aspects/desktop/niri/settings/startup.nix`), and every shell lookup matched
-`quickshell|qs` only. So the original shell would never be captured, never evicted,
-and never replayed — on exactly the machine this work targets.
+- **T0 — declaration.** `compositors` in the catalog. Free, instant, and the only
+  tier that can lie: ChromaShell-Flake has no compositor option at all and is
+  Hyprland-only, so its entry is pure assertion.
+- **T1 — eval-time assertion.** Because `compositor` is known at evaluation time,
+  the module can refuse an incompatible pair at build time. Does not verify the
+  declaration; prevents selecting a bad pair. *(In progress.)*
+- **T2 — static evidence over the built artifact.** Scan the store path for
+  bindings: Hyprland → `Quickshell.Hyprland`, `Hyprland.`, `hyprctl`; niri →
+  `niri msg`, `NIRI_SOCKET`, `Quickshell.Niri`. Measured separation:
+  jutraim's `services/Niri.qml` has 26 `niri msg` calls; upstream Caelestia has
+  zero niri references and 13 qml files touching `Quickshell.Hyprland`. Verdicts:
+  `Supports` / `NoEvidence` / `Contradicts`. *Not built.* Worth building before
+  T3 because eviction has already killed the user's shell by the time T3 can
+  judge — a cheap offline probe can refuse first.
+- **T3 — runtime observation.** What `verify_argv` does today: a matching layer
+  surface since the baseline, which cannot be produced without real integration.
+- **T4 — record the observation.** Persist which compositor a rice was seen
+  working on, against the exact rev. *Not built.*
 
-```rust
-pub const DEFAULT_SHELL_NAMES: &[&str] = &["quickshell", "qs", "noctalia-qs", "noctalia"];
-pub fn normalize_shell_name(raw: &str) -> String;   // unwraps Nix `.foo-wrapped` + store paths
-pub struct ShellMatcher { /* names */ }
-pub fn matching_pids(proc_root: &Path, m: &ShellMatcher) -> Result<Vec<i32>>;
-pub fn kill_shells(proc_root: &Path, m: &ShellMatcher) -> Result<()>;
-pub fn find_running_shell(proc_root: &Path, m: &ShellMatcher) -> Result<Option<QuickshellProc>>;
+The honest limit of T2–T4: they verify the shell **runs and renders**. They do not
+verify that compositor-side *features* the shell wants exist — niri `layer-rule`s
+for a backdrop, Hyprland special workspaces. That is a capability gap, not a
+compatibility failure, and has to be declared.
+
+## 9. Known gaps
+
+1. **The module has no test.** `nix flake check` warns `unknown flake output
+   'homeManagerModules'` and skips it entirely, so a broken option type or an
+   assertion that always fails would still report success. A
+   `checks.<system>.hm-module` using `lib.evalModules` closes this.
+2. **The Nix preview path has never run end to end.** Every stage is proven
+   individually (build, launch, namespaces, IPC); the sequence
+   build → evict → launch → verify → revert is not.
+3. **`replay_original_shell` on niri is untested**, and it is the only thing
+   standing between a failed preview and a user with no desktop shell.
+4. **T2 and T4 are unwritten** (§8).
+5. **The remote catalog is unwritten** (`catalog update` + a `catalog/v2` branch).
+   It matters for safety: a fetched catalog evaluates arbitrary flakes as the
+   user with no release review in between, so it needs HTTPS only, 40-hex revs,
+   and a consent prompt for rices outside the bundled set.
+6. **`nix run` has not been visually confirmed.** The GUI is built and its wrapper
+   environment is verified; appearing on screen needs the session owner.
+
+## 10. Testing it
+
+```sh
+# Read-only, safe: which platform and compositor were detected, and why not
+nix run --refresh 'github:Avanonyme/rice-cooker?ref=feat/nix-rices#backend' -- env
+nix run --refresh 'github:Avanonyme/rice-cooker?ref=feat/nix-rices#backend' -- list
+
+# Preview: KILLS the running shell (noctalia owns the notification server)
+nix run --refresh 'github:Avanonyme/rice-cooker?ref=feat/nix-rices#backend' -- preview niri-caelestia
+
+# Recovery if revert fails
+noctalia &
+
+# The GUI
+nix run --refresh github:Avanonyme/rice-cooker?ref=feat/nix-rices
 ```
 
-`pkill -x` was also structurally wrong: `-x` matches `comm`, which the kernel
-truncates to 15 characters, so `.quickshell-wrapped` and store-path argv0 binaries
-never matched. Pids are now discovered from procfs and signalled by pid.
+`--refresh` is not optional: nix caches branch→rev resolution and will silently
+rebuild the previous source. The symptom is an unchanged derivation hash.
 
-`find_running_quickshell()` / `kill_quickshell()` remain as default-matcher wrappers,
-so `pipeline.rs` needs no change.
+Logs: `$XDG_CACHE_HOME/rice-cooker/last-run.log` and `last-run.ndjson`.
 
-## 3. Platform seam — SPECIFIED
-
-Dispatch is **per stage**, not per package operation. A trait shaped like
-`install_packages`/`remove_packages` would force Nix into package-list semantics it
-does not have.
-
-`backend/src/platform/mod.rs`
-
-```rust
-pub enum Platform { Arch(arch::ArchPacman), Nix(nix::NixHome) }   // enum dispatch
-
-pub trait RiceRealizer {
-    fn detect_env(&self) -> EnvReport;                                 // feeds `env`
-    fn preflight(&self, entry: &RiceEntry, mode: ActivateMode) -> Result<()>;
-    /// Replaces `deps::missing` in the same_current short-circuit.
-    fn is_satisfied(&self, entry: &RiceEntry, mode: ActivateMode) -> Result<bool>;
-    /// Replaces Clone + Deps + Symlink (and adds Activate on Nix).
-    fn realize<W: Write>(&self, ctx: &mut StageCtx<W>, name: &str, entry: &RiceEntry,
-                         mode: ActivateMode, carry: Option<&Rollback>) -> Result<Realized>;
-    fn rollback<W: Write>(&self, ctx: &mut StageCtx<W>, rec: &InstallRecord) -> Result<()>;
-    fn reconcile_journal(&self, paths: &Paths) -> Result<()>;           // replaces reconcile_pending_deps
-}
-pub struct Realized { pub launch: LaunchSpec, pub rollback: Rollback }
-
-impl Platform {
-    /// --platform / $RICE_COOKER_PLATFORM > config.toml `platform`
-    /// > /etc/NIXOS or (nix on PATH && hm target configured) > /etc/arch-release + paru|yay
-    pub fn detect(flag: Option<PlatformId>) -> Result<Self>;
-}
-```
-
-Stays concrete and shared in `pipeline.rs`: `try_stage!`, `hello`, `step`, `emit_fail`,
-`acquire_lock`, evict orchestration, `fail_and_rollback_activation`,
-`replay_original_shell`, `record_original`, and the Notifiers / KillQuickshell /
-Launch / Verify stages.
-
-Moves: all of `deps.rs` plus `pacman_explicit`, `pacman_all`, `pacman_query`,
-`pacman_relations_overlap_removed`, `diff_packages`, `do_clone`, `clone_cache_hit`,
-`do_deps`, `DepsOutcome`, `union_sorted`, `remove_rice_symlink` and
-`reconcile_pending_deps` → `platform/arch.rs`, and `deps.rs` is deleted.
-
-**Launch abstraction** (`LaunchSpec` / `LaunchHandle`):
-
-```rust
-pub enum LaunchSpec {
-    Quickshell { bin: String, config: String },   // default: quickshell -c <name>
-    Argv { argv: Vec<String> },                   // amane, noctalia
-    SystemdUnit { unit: String },                 // the R2 "reload" path
-}
-```
-
-`SystemdUnit` uses `systemctl --user restart <unit>`; the others use
-`systemd-run --user --collect --unit=rice-cooker-preview --setenv=WAYLAND_DISPLAY=…
---setenv=NIRI_SOCKET=… -p StandardOutput=file:<log>` with the existing `setsid -f` as
-fallback when no user manager is reachable. `LaunchSpec::Quickshell` keeps
-`pgrep -xf "quickshell -c <n>"` working today; `systemd-run` is the robust path,
-because a Nix wrapper changes argv0.
-
-## 4. Catalog v2 — IMPLEMENTED (parser) / SPECIFIED (fetch)
-
-`backend/src/catalog.rs`. Every added field is defaulted, so the eight shipped
-entries parse unchanged and `compositors` defaults to `["hyprland"]` — the v1
-assumption exactly.
-
-```toml
-[_catalog]
-schema = 2                                    # absent ⇒ current; > 2 ⇒ refuse the catalog
-
-[noctalia]
-display_name = "Noctalia"
-creator_name = "noctalia-dev"
-repo   = "https://github.com/noctalia-dev/noctalia-shell"
-commit = "d7b68652e79bce5813dc4fea7e51636a5da3e1b7"   # nix: 40-hex or a ref, never a short SHA
-compositors = ["hyprland", "niri"]            # default ["hyprland"]
-layer_namespaces = ["^noctalia-"]             # required to verify on niri
-
-[noctalia.launch]
-kind = "argv"                                 # "quickshell" | "argv" (default: quickshell -c <name>)
-argv = ["noctalia"]
-
-[noctalia.nix]
-shape = "module"                              # "module" | "package" | "dotfiles"
-module = "homeModules.default"
-system_module = "nixosModules.default"        # informational — never applied
-system_module_required = false                # true ⇒ install_supported = false
-packages = ["cliphist", "wl-clipboard"]       # nixpkgs attr paths → home.packages
-follows_nixpkgs = true
-mutable_config = false                        # true ⇒ activation stages a writable copy
-package = "default"                           # packages.<system>.<x>, shape = "package"
-
-[noctalia.nix.hm_config.programs.noctalia]
-enable = true                                 # data only — never interpolated as Nix text
-```
-
-Validation that matters:
-
-- Nix entries reject a **short SHA** (`is_hex` + `len != 40`): a short SHA resolves
-  non-deterministically as the log grows.
-- `module`, `packages` and `system_module` must be dotted `[A-Za-z0-9_-]` paths, and
-  flake refs are rejected if they contain `"`, `'`, `;`, `$`, `` ` `` or a newline.
-  This is the only channel by which catalog data reaches the generated Nix module, so
-  it is validated rather than escaped.
-- `symlink_src`/`symlink_dst` are applicable to Arch entries and `shape = "dotfiles"`
-  only. A `module` rice places its own config; a `package` rice has no config tree.
-  They were previously mandatory, so they became `Option` and are reached through
-  `RiceEntry::symlink()` / `RiceEntry::links_into_config()`.
-- `_` is now a reserved name prefix, so the metadata table can never be a rice.
-
-**Two parse modes.** `Catalog::parse` is strict and is what CI and the bundled catalog
-use — `the_bundled_catalog_parses_strictly` is a release gate. `parse_lenient` skips a
-single bad entry with a warning and is for a catalog fetched at runtime. Without this,
-one new-field entry breaks the whole catalog for every older binary, because
-`#[serde(flatten)]` on `rices` means the top-level table *is* the entry map and there is
-no room for a schema key until `_catalog` is lifted out first.
-
-**Fetching (R6).** New subcommand `catalog update` downloads from a `catalog/v2` branch
-into `$XDG_CACHE_HOME/rice-cooker/catalog.toml` with ETag/If-None-Match.
-`catalog_path` resolution becomes: `--catalog` → `$RICE_COOKER_CATALOG` → cached (if it
-parses at schema ≤ 2) → cwd dev paths → XDG bundled. Electron must stop forcing
-`--catalog` when packaged (`backendBaseArgs` currently always passes it, which blocks
-R6 even once the backend is fixed).
-
-## 5. Nix activation — SPECIFIED
-
-Generated artifacts live in `S = $XDG_DATA_HOME/rice-cooker/nix/`.
-
-- **`flake.nix`** — regenerated; the only interpolated text is validated input names
-  and URLs. Rice input names are `rice-<name>` with `[^A-Za-z0-9_-]` → `_`.
-- **`rices.json`** — data only: `shape`, `input`, `module`, `package`, `packages`,
-  `hm_config`, `skip_import`, `config_rel`, `symlink_src`, `launch_argv`, `mutable`.
-- **`module.nix`** — static template, one specialisation per rice:
-
-```nix
-inputs: { lib, pkgs, ... }:
-let rices = builtins.fromJSON (builtins.readFile ./rices.json);
-    at = p: s: lib.getAttrFromPath (lib.splitString "." p) s;
-    mk = n: r: let src = inputs.${r.input}; in {
-      imports = lib.optional (r.shape == "module" && !r.skip_import) (at r.module src);
-      config = lib.mkMerge [
-        r.hm_config
-        { home.packages = map (p: at p pkgs) r.packages;
-          systemd.user.services.rice-cooker-shell.Service.ExecStart =
-            lib.mkForce (lib.escapeShellArgs r.launch_argv); }
-        (lib.mkIf (r.shape == "dotfiles" && !r.mutable)
-          { xdg.configFile.${r.config_rel}.source = "${src}/${r.symlink_src}"; })
-      ];
-    };
-in { specialisation = lib.mapAttrs (n: r: { configuration = mk n r; }) rices; }
-```
-
-**`skip_import`** exists because a specialisation inherits the parent config through
-`extendModules`: if the base config already imports the rice's module — and on this
-desktop it already imports `noctalia.homeModules.default` — importing it again errors
-with "option already declared". It is probed with
-`nix eval '<target>#homeConfigurations."<attr>".options' --apply 'o: o ? programs && o.programs ? noctalia'`.
-
-Activation, as argv:
-
-| Stage | Command |
-| --- | --- |
-| Clone (lock) | `nix flake lock "$S"` |
-| Deps (build) | `nix build --no-link --print-out-paths --no-write-lock-file --override-input rice-cooker-state "path:$S" "$HOME/.config/nix#homeConfigurations.\"avanonyme@boreal\".activationPackage"` |
-| Activate | `"$out/specialisation/<rice>/activate"`, or `home-manager switch --flake … --specialisation <rice>` on HM ≥ 25.11 |
-| Launch (R2) | `systemctl --user restart rice-cooker-shell.service` |
-| Revert | `<pre_generation.store_path>/activate`, then restart the base unit |
-
-`preview_deps` has no meaning on Nix: the closure is complete either way.
-
-**System modules degrade gracefully.** `system_module_required = false` (ChromaShell):
-ignore it, warn on stderr. `system_module_required = true`: `install_supported = false`
-with `unsupported_reason = "needs NixOS module (system rebuild)"`, and write a Den
-aspect stub to `$S/system-snippets/<rice>.nix` for the user to adopt out of band.
-`nixos-rebuild` is never invoked.
-
-## 6. Record v2 — SPECIFIED
-
-`SCHEMA_VERSION = 2`; `load_record` keeps accepting v1 and maps it to
-`Rollback::Pacman`, so a downgrade does not break `status`/`uninstall`.
-
-```rust
-pub struct InstallRecord {
-    schema_version, name, commit, installed_at,
-    mode: RecordMode,            // install | preview
-    compositor: CompositorId,
-    launch: LaunchSpec,
-    rollback: Rollback,
-}
-pub enum Rollback {                                   // #[serde(tag = "kind")]
-    Pacman { symlink_path, symlink_target, pacman_diff },
-    HomeManager { target, pre_generation: Option<HmGeneration>, generation: HmGeneration,
-                  locked_rev: String, nar_hash: String },
-}
-pub enum Journal { Pacman(PendingDeps), Nix(PendingActivation { name, commit, pre_generation, started_at }) }
-```
-
-- `PacmanDiff` is replaced as the rollback unit by HM generations — orderable,
-  enumerable, and restorable without recomputing a package diff.
-- `PendingDeps` becomes one variant of `Journal`, still reading the legacy
-  `pending-deps.json`.
-- **Nix reconcile:** read the generation from
-  `readlink ~/.local/state/nix/profiles/home-manager`; if it differs from
-  `pre_generation` and `<gen>/home-files/.local/state/rice-cooker/active` names the
-  journal's rice, write the record; otherwise clear the journal.
-- **Evict is not `uninstall_locked` on Nix.** The new record *inherits*
-  `pre_generation`, so A → B → C keeps the pre-rice generation; then the outgoing
-  record is deleted. Calling uninstall would replay the original shell on every hop.
-- **Revert** kills via `LaunchHandle`, activates `pre_generation.store_path`, and
-  restarts the base unit. In integrated mode the base `rice-cooker-shell.service` *is*
-  the original, so no argv replay; `replay_original_shell` remains for own-Arch mode.
-  If `argv[0]` is a garbage-collected store path, resolve its basename on `PATH`.
-
-## 7. Remaining diff list
-
-| File | Change |
-| --- | --- |
-| `backend/src/platform/{mod,arch,nix/{mod,gen,hm}}.rs` | new — §3, §5 |
-| `backend/src/deps.rs` | deleted (content moves to `platform/arch.rs`) |
-| `backend/src/main.rs` | add `Env`, `CatalogUpdate`, `NixSetup` subcommands; `step` emits `activate` |
-| `backend/src/events.rs` | **⚠ schema bump to 2**: new `activate` step, `Hello { …, platform, compositor }`. The pinned wire cases in `every_variant_roundtrips_through_ndjson_schema` must be updated in the same commit |
-| `backend/src/install/record.rs` | **⚠** `SCHEMA_VERSION` 1→2, `Rollback`, `Journal` (§6) |
-| `backend/src/install/pipeline.rs` | `run_activate` takes `Platform`; preflight fails `compositor_unsupported` when `!entry.supports(session.compositor.id())`; capture the layer baseline between KillQuickshell and Launch; `ListRow` gains `compositors`, `unsupported_reason` |
-| `electron/main/index.ts` | `environmentCheck` → `execFileAsync(backendBin(), ['env'])`, dropping `/etc/arch-release`, the `HYPRLAND_INSTANCE_SIGNATURE` gate and `executableInPath('quickshell')`. Delete `CONFLICTING_SHELLS` (it moves to the backend and must be scanned on **every** compositor — today it is skipped unless Hyprland). Rename `applyHyprlandWindowProps` → `applyCompositorWindowProps` (niri is a no-op; niri has no runtime `setprop`). Only pass `--catalog` when `!app.isPackaged` |
-| `src/shared/backend.ts` | `EnvironmentCheckResult` gains `compositor`, `platform`, `reasons`; `RiceListRow` gains `compositors`, `unsupported_reason?` |
-| `src/pages/pick-a-rice/PickARice.tsx` | boot copy from `result.reasons[0]`; **do not rename** the `deps`/`launch`/`verify` step names — progress keys off them |
-| `src/pages/pick-a-rice/components/BootScreen.tsx` | same copy change; compositor-conditional sticker |
-| `nix/hm-module-niri.nix` | new, exported as `homeManagerModules.niri` — a niri window-rule for `app-id="^(rice-cooker\|electron)$"`, `title="^Rice Cooker$"`: `geometry-corner-radius 0`, `clip-to-geometry true`, `shadow off`, `border off`, `focus-ring off`, `open-floating true` |
-| `packaging/aur/rice-cooker/PKGBUILD` | `hyprland` moves to `optdepends` alongside `niri` |
-| `~/.config/nix/modules/aspects/desktop/rice-cooker.nix` | new Den aspect (§8) |
-
-## 8. Den integration
-
-```nix
-{ inputs, ... }: {
-  flake-file.inputs.rice-cooker = {
-    url = "github:amarsbar/rice-cooker";
-    inputs.nixpkgs.follows = "nixpkgs";
-  };
-  # The generated state flake, so `home-manager switch` in ~/.config/nix
-  # activates rice specialisations alongside the base config.
-  flake-file.inputs.rice-cooker-state = {
-    url = "path:/home/avanonyme/.local/share/rice-cooker/nix";
-    inputs.nixpkgs.follows = "nixpkgs";
-    inputs.home-manager.follows = "home-manager";
-  };
-
-  den.aspects.desktop.rice-cooker.homeManager = { pkgs, ... }: {
-    imports = [
-      inputs.rice-cooker-state.homeManagerModules.default
-      inputs.rice-cooker.homeManagerModules.niri
-    ];
-    home.packages = [ inputs.rice-cooker.packages.${pkgs.stdenv.hostPlatform.system}.default ];
-
-    # The base shell is declaratively the "original rice".
-    systemd.user.services.rice-cooker-shell = {
-      Unit.PartOf = [ "graphical-session.target" ];
-      Service.ExecStart =
-        "${inputs.noctalia.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/noctalia";
-      Install.WantedBy = [ "graphical-session.target" ];
-    };
-  };
-}
-```
-
-Plus: remove `{_args = [ "noctalia" ];}` from
-`modules/aspects/desktop/niri/settings/startup.nix` — that file already starts
-`graphical-session.target`, and the shell is now a unit rice-cooker can restart.
-
-Adopting this requires moving `avanonyme@boreal` to a **standalone Den home**
-(`hmContext { home }`) and dropping NixOS-module HM for that user only. `gamer` and
-`tux` are unaffected.
-
-## 9. Risks
-
-1. **Two Home Manager instances for one user.** Both track "the old generation"
-   through the same per-user profile and gcroot, so each would clean up the other's
-   files. A second HM instance is refused when
-   `~/.local/state/home-manager/gcroots/current-home` or `home-manager-$USER.service`
-   exists. Boreal requires the standalone migration instead. **Unverified** — read
-   `modules/lib-bash/activation-init.sh` and `modules/files.nix` at the pinned HM rev
-   before shipping the owned mode.
-2. **Duplicate option declarations** when the base already imports the rice's module.
-   Handled by the `skip_import` probe; if the probe fails, eval errors are surfaced
-   cleanly rather than swallowed.
-3. **Stale lock.** A plain `home-manager switch` in `~/.config/nix` without
-   `--override-input` activates the stale `rice-cooker-state` and silently drops the
-   rice. Mitigated by `nix flake update rice-cooker-state` after a successful install,
-   at the cost of a dirty `flake.lock`.
-4. **Pre-rice generation garbage-collected.** Falls back to activating the base
-   config; the record's store path is pinned with `nix-store --add-root` under
-   `$XDG_DATA_HOME/rice-cooker/gcroots/`.
-5. **Store paths are read-only** and break rices that write into their own config
-   directory. Needs `mutable_config` per rice: activation copies `${src}` once into
-   `$XDG_DATA_HOME/rice-cooker/mutable/<n>` and links there via
-   `config.lib.file.mkOutOfStoreSymlink`.
-6. **A remote catalog executes arbitrary flake eval and activation scripts as the
-   user** with no release review in between. Require 40-hex revisions, HTTPS only, and
-   a one-time consent prompt before the first Nix activation of a rice not in the
-   bundled catalog.
-7. **`systemd-run --user` environment.** The user manager may lack
-   `WAYLAND_DISPLAY`/`NIRI_SOCKET`, so pass them with `--setenv`; fall back to
-   `setsid` when `systemctl --user` is unreachable.
-8. **Specialisation activate vs `home-manager switch --specialisation`.** Activating
-   a specialisation directly sets the profile head to that specialisation's
-   generation, so revert must use the recorded `pre_generation`, not `--rollback`,
-   when other generations intervened.
-9. **Niri rices that need `layer-rule`s** (noctalia's overview backdrop, for example)
-   cannot change niri's HM-generated `config.kdl` unless they share the Home Manager
-   instance. Integrated mode can set
-   `wayland.windowManager.niri.settings.layer-rule` inside the specialisation and niri
-   reloads on change; owned mode cannot, so such rices are declared unsupported there.
-
-## 10. Open verifications (need boreal)
-
-- `ps -eo pid,comm,args | grep -Ei 'qs|quickshell|noctalia'` — confirm the shell
-  process name and whether a Nix wrapper is in the path.
-- `ls $XDG_RUNTIME_DIR | grep niri` — confirm the socket filename in practice.
-- `home-manager --version` — confirm ≥ 25.11 for `--specialisation`.
-- `nix eval .#homeConfigurations` once a standalone Den home exists.
-- `amane`'s real launch subcommand (its flake exposes only `packages.default`).
-
-Test surface per phase: `cargo test` + `cargo insta review` in `backend/`, and
-`npm run typecheck` after any change touching `src/shared/backend.ts`.
+`nix flake check` gates the Rust suite and `npm run typecheck`
+(`checks.<system>.backend` and `checks.<system>.typecheck`), and it caught two
+bugs that macOS hid: an unparseable `RICE_COOKER_PLATFORM` silently resolving to
+Arch in a sandbox without `nix` on `PATH`, and `read_dir` order making
+`matching_pids` return a different sequence per filesystem.

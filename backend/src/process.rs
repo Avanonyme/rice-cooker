@@ -209,8 +209,9 @@ pub fn kill_shells(proc_root: &Path, matcher: &ShellMatcher) -> Result<()> {
     }
     signal(&survivors, "-KILL")?;
 
-    // A surviving SIGKILL means D-state, and quickshell's `--no-duplicate`
-    // default would make the follow-up launch exit silently.
+    // A surviving SIGKILL means D-state. Report it: the caller is about to launch
+    // a replacement, and two shells fighting for the same layer surfaces is worse
+    // than a visible error.
     thread::sleep(Duration::from_millis(KILL_POLL_MS));
     let survivors = matching_pids(proc_root, matcher)?;
     if !survivors.is_empty() {

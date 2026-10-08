@@ -199,6 +199,22 @@ fn run_activate<W: Write>(
         )?;
         return Ok(false);
     }
+    // On Nix the flake *is* the realization, so an entry with no `[nix]` block
+    // cannot be previewed at all. Refuse in preflight rather than failing in the
+    // middle of the pipeline.
+    if platform == PlatformId::Nix && entry.nix.is_none() {
+        emit_fail(
+            events,
+            "preflight",
+            &format!(
+                "{name}: declared for Arch only (no [nix] block), so it cannot be \
+                 realized on Nix"
+            ),
+            None,
+        )?;
+        return Ok(false);
+    }
+
     // Only Arch needs an AUR helper and its polkit prompt.
     if platform == PlatformId::Arch && !selected_deps.is_empty() {
         try_stage!(
@@ -258,10 +274,17 @@ fn run_activate<W: Write>(
     // Nix builds a flake and needs neither: a Nix-packaged shell is a wrapper
     // carrying its own config path, so there is nothing to symlink.
     let plan: LaunchPlan = if platform == PlatformId::Nix {
-        let nix = entry
-            .nix
-            .as_ref()
-            .expect("install_is_supported checked that [nix] is present");
+        let Some(nix) = entry.nix.as_ref() else {
+            // Unreachable given the preflight guard above; kept graceful so a
+            // reordering cannot turn this into a panic.
+            emit_fail(
+                events,
+                "preflight",
+                &format!("{name}: no [nix] block to realize"),
+                None,
+            )?;
+            return Ok(false);
+        };
         let flake = nix.flake_ref(&entry.repo, &entry.commit);
 
         step(events, Step::Deps, StepState::Start)?;
@@ -380,8 +403,18 @@ fn run_activate<W: Write>(
     }
     step(events, Step::Notifiers, StepState::Done)?;
 
+    // A Nix rice's binary is a store path, so the default matcher would leave a
+    // previously previewed shell alive and two shells would fight for surfaces.
+    let incoming_shell = match &plan {
+        LaunchPlan::Nix { launch_argv, .. } => launch_argv
+            .first()
+            .map(|argv0| process::normalize_shell_name(argv0))
+            .into_iter()
+            .collect::<Vec<String>>(),
+        LaunchPlan::ByName => Vec::new(),
+    };
     step(events, Step::KillQuickshell, StepState::Start)?;
-    if let Err(e) = process::kill_quickshell() {
+    if let Err(e) = process::kill_quickshell_with(&incoming_shell) {
         return fail_and_rollback_activation(
             paths,
             events,
@@ -525,8 +558,23 @@ fn uninstall_locked<W: Write>(
     let record_path = try_stage!(events, "record", "path", paths.record_json(name));
     let record = try_stage!(events, "record", "load", load_record(&record_path));
 
+    // `caelestia-shell` is not `quickshell`, so a Nix rice needs its own argv0 to
+    // be matched or it survives its own uninstall.
+    let outgoing_shell = match &record.nix {
+        Some(nix) => nix
+            .launch_argv
+            .first()
+            .map(|argv0| process::normalize_shell_name(argv0))
+            .into_iter()
+            .collect::<Vec<String>>(),
+        None => Vec::new(),
+    };
     step(events, Step::KillQuickshell, StepState::Start)?;
-    try_stage!(events, "kill_quickshell", process::kill_quickshell());
+    try_stage!(
+        events,
+        "kill_quickshell",
+        process::kill_quickshell_with(&outgoing_shell)
+    );
     step(events, Step::KillQuickshell, StepState::Done)?;
 
     // A Nix record has no packages to remove and no symlink to drop: the store
@@ -706,7 +754,10 @@ fn remove_rice_symlink(record: &InstallRecord) -> Result<()> {
         .with_context(|| format!("removing symlink {}", symlink_path.display()))
 }
 
-pub fn list(cat: &Catalog, paths: &Paths) -> Result<Vec<ListRow>> {
+/// `platform` is a parameter rather than a hidden `detect()` call so the output
+/// is reproducible: on a machine that happens to have both `nix` and `pacman` on
+/// PATH, a hidden read would make this list environment-dependent.
+pub fn list(cat: &Catalog, paths: &Paths, platform: PlatformId) -> Result<Vec<ListRow>> {
     let current = read_current(paths)?;
     Ok(cat
         .rices
@@ -716,7 +767,7 @@ pub fn list(cat: &Catalog, paths: &Paths) -> Result<Vec<ListRow>> {
             display_name: entry.display_name.clone(),
             creator_name: entry.creator_name.clone(),
             repo: entry.repo.clone(),
-            install_supported: !entry.install_deps.is_empty(),
+            install_supported: entry.install_is_supported(platform),
             installed: current.as_deref() == Some(name.as_str()),
         })
         .collect())

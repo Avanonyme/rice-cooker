@@ -47,6 +47,9 @@ fn cmd(t: &TempDir) -> Command {
         .env("XDG_CACHE_HOME", t.path().join("cache"))
         .env("XDG_DATA_HOME", t.path().join("data"))
         .env("RICE_COOKER_CACHE_DIR", t.path().join("cache/rice-cooker"))
+        // Pin the platform: otherwise the `install_supported` column depends on
+        // whether the host happens to have `nix` on PATH.
+        .env("RICE_COOKER_PLATFORM", "arch")
         .env("PATH", std::env::var("PATH").unwrap_or_default());
     c
 }

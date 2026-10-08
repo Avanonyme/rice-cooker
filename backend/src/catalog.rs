@@ -142,6 +142,15 @@ pub struct NixDecl {
     /// `homeManagerModules.<this>` attribute path. Required for `shape = "module"`.
     #[serde(default)]
     pub module: Option<String>,
+    /// This rice's own enable option, as a dotted path, e.g.
+    /// `programs.caelestia.enable`.
+    ///
+    /// A module cannot choose its imports from configuration values, so the user
+    /// has to import the rice's module themselves. This lets
+    /// `programs.rice-cooker` *verify* they did, instead of silently forcing a
+    /// shell whose module was never imported.
+    #[serde(default)]
+    pub hm_option: Option<String>,
     /// The attribute under `packages.<system>`. Defaults to `default`.
     #[serde(default)]
     pub package: Option<String>,
@@ -510,6 +519,10 @@ fn validate_nix(name: &str, entry: &RiceEntry) -> Result<()> {
 
     if let Some(system_module) = nix.system_module.as_deref() {
         ensure_attr_path(name, "nix.system_module", system_module)?;
+    }
+
+    if let Some(hm_option) = nix.hm_option.as_deref() {
+        ensure_attr_path(name, "nix.hm_option", hm_option)?;
     }
 
     ensure!(
@@ -899,6 +912,29 @@ mod tests {
         "#;
         let err = Catalog::parse(t).unwrap_err().to_string();
         assert!(err.contains("requires nix.module"), "got: {err}");
+    }
+
+    #[test]
+    fn hm_option_is_parsed_and_validated() {
+        let t = r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            [x.nix]
+            shape = "package"
+            hm_option = "programs.caelestia.enable"
+        "#;
+        let c = Catalog::parse(t).unwrap();
+        assert_eq!(
+            c.get("x").unwrap().nix.as_ref().unwrap().hm_option.as_deref(),
+            Some("programs.caelestia.enable")
+        );
+
+        // An injections-shaped path must be refused like any other attr path.
+        let bad = t.replace("programs.caelestia.enable", r"programs.${evil}");
+        assert!(Catalog::parse(&bad).is_err());
     }
 
     #[test]

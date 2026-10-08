@@ -3,7 +3,16 @@
 # Deliberately framework-agnostic. Nothing here depends on how a configuration is
 # organised, so it works in plain Home Manager, as a NixOS module, or under Hjem.
 #
-# Add this flake as an input, enable the program, and name the shell you want:
+# This module **selects, launches and asserts**. It does not import the rice's own
+# module: a module cannot choose its imports from configuration values, so doing
+# that from here is either invalid or infinitely recursive. The user imports it,
+# and this module verifies they did — via `options`, not `config`, because
+# deciding what to define by reading what is defined is the same trap.
+#
+#   imports = [
+#     rice-cooker.homeManagerModules.default
+#     inputs.niri-caelestia.homeManagerModules.default
+#   ];
 #
 #   programs.rice-cooker = {
 #     enable = true;
@@ -12,8 +21,8 @@
 #   };
 #
 # `enable` is what makes the selection win over whatever the user's own
-# configuration already starts: the rice's module is imported, its package is
-# installed, and its launcher is registered as a unit under `mkForce`.
+# configuration already starts: unless the other shell is disabled, the
+# launcher is forced with `mkForce` and the conflict is reported as a warning.
 {
   self,
   catalog,
@@ -23,6 +32,7 @@
   config,
   lib,
   pkgs,
+  options,
   ...
 }:
 let
@@ -33,9 +43,9 @@ let
 
   entry = if cfg.shell == null then null else catalog.${cfg.shell};
 
-  # The flake input the user supplied for the selected rice, if any. Rice inputs
-  # are not fetched here: `builtins.getFlake` needs impure evaluation, so the
-  # caller supplies them and this module wires them up.
+  # The flake input the user supplied for the selected rice. Rice inputs are not
+  # fetched here: `builtins.getFlake` needs impure evaluation, so the caller
+  # supplies them and this module wires them up.
   riceInput =
     if cfg.shell != null && builtins.hasAttr cfg.shell cfg.rices then
       cfg.rices.${cfg.shell}
@@ -48,6 +58,13 @@ let
       riceInput.packages.${system}.${lib.attrByPath [ "nix" "package" ] "default" entry}
     else
       null;
+
+  # The rice's own enable option, when the catalog names one. Used to verify the
+  # user imported the rice's module and switched it on.
+  hmOption = if entry == null then null else lib.attrByPath [ "nix" "hm_option" ] null entry;
+  hmOptionPath = if hmOption == null then null else lib.splitString "." hmOption;
+  hasRiceOption = hmOptionPath != null && lib.hasAttrByPath hmOptionPath options;
+  riceOptionEnabled = hasRiceOption && lib.getAttrFromPath hmOptionPath config;
 
   # Mirrors the backend's argv derivation: a bare binary name resolves against
   # the rice's own package, so a shell's wrapper (which carries its own config
@@ -80,9 +97,9 @@ let
   launchCommand = if cfg.launchCommand != [ ] then cfg.launchCommand else resolvedLaunch;
 
   # Other shells this module knows how to recognise. The user's own
-  # configuration owns its startup items, so `enable` can import and force a
-  # launcher but cannot delete someone else's; it reports instead of pretending.
-  competingShells = lib.filter (path: lib.hasAttrByPath path config && lib.getAttrFromPath path config) [
+  # configuration owns its startup items, so `enable` can force a launcher but
+  # cannot delete someone else's; it reports the conflict instead of pretending.
+  competingShells = lib.filter (path: lib.hasAttrByPath path options && lib.getAttrFromPath path config) [
     [ "programs" "noctalia" "enable" ]
     [ "programs" "caelestia" "enable" ]
     [ "programs" "chromashell" "enable" ]
@@ -108,7 +125,8 @@ in
         and forces nothing.
 
         The list comes from the catalog this flake ships, so it cannot drift from
-        what the backend can actually activate.
+        what the backend can actually activate. The rice's own Home Manager module
+        must be imported separately; this module asserts that it was.
       '';
     };
 
@@ -121,8 +139,9 @@ in
         }
       '';
       description = ''
-        Flake inputs for the rices you want to select, keyed by catalog name. A
-        rice becomes selectable only once its input is provided.
+        Flake inputs for the rices you want to select, keyed by catalog name.
+        Required for the selected rice so its launcher can be resolved to a store
+        path rather than to whatever is on `PATH`.
       '';
     };
 
@@ -157,8 +176,8 @@ in
 
       assertions = [
         {
-          # A named shell with no input would silently install the tool and do
-          # nothing, which is the worst possible outcome for `enable = true`.
+          # A named shell with no input would install the tool and resolve the
+          # launcher to a PATH lookup that probably fails.
           assertion = cfg.shell == null || riceInput != null;
           message = ''
             programs.rice-cooker: shell = "${toString cfg.shell}" needs its flake
@@ -168,6 +187,22 @@ in
 
             rice-cooker does not fetch rice flakes itself: evaluating a flake
             reference at build time requires impure evaluation.
+          '';
+        }
+        {
+          # `enable = true` next to a rice whose module was never imported would
+          # start a shell that nothing configured.
+          assertion = cfg.shell == null || hmOptionPath == null || riceOptionEnabled;
+          message = ''
+            programs.rice-cooker: shell = "${toString cfg.shell}" is forced, but
+            ${toString hmOption} is not enabled, so the rice's own module was
+            never imported or never switched on. Add both:
+
+              imports = [ inputs.${toString cfg.shell}.homeManagerModules.default ];
+              ${toString hmOption} = true;
+
+            A module cannot choose its imports from configuration values, so this
+            has to be done by you rather than by programs.rice-cooker.
           '';
         }
       ];
@@ -181,8 +216,6 @@ in
     }
 
     (mkIf (cfg.shell != null && riceInput != null) {
-      imports = lib.optional (riceInput ? homeManagerModules) riceInput.homeManagerModules.default;
-
       home.packages = lib.optional (ricePackage != null) ricePackage;
 
       systemd.user.services = mkIf cfg.systemd.enable {

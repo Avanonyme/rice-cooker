@@ -120,3 +120,5 @@ argv = ["caelestia-shell"]
 shape = "package"
 package = "default"
 flake = "github:jutraim/niri-caelestia-shell/fe36491a77c56ac51d6cad1c6fc05f9828fad837"
+# So `programs.rice-cooker` can verify the user imported the rice's module.
+hm_option = "programs.caelestia.enable"

@@ -257,9 +257,16 @@ pub fn install_snippet(name: &str) -> String {
          #\n\
          # `enable` is what forces this shell over whatever your own config\n\
          # already starts, and `shell` selects from the flake's built-in list.\n\
+         #\n\
+         # The rice's module has to be imported by you: a module cannot choose its\n\
+         # imports from configuration values, and `programs.rice-cooker` asserts\n\
+         # that the option below exists rather than importing it for you.\n\
+         imports = [ inputs.{name}.homeManagerModules.default ];\n\
+         \n\
          programs.rice-cooker = {{\n\
          \x20 enable = true;\n\
          \x20 shell = \"{name}\";\n\
+         \x20 rices.{name} = inputs.{name};\n\
          }};\n"
     )
 }
@@ -439,11 +446,15 @@ mod tests {
     }
 
     #[test]
-    fn install_snippet_names_the_rice_and_forces_enable() {
+    fn install_snippet_is_adoptable_as_is() {
         let snippet = install_snippet("niri-caelestia");
         assert!(snippet.contains("programs.rice-cooker"));
         assert!(snippet.contains("enable = true"));
         assert!(snippet.contains("shell = \"niri-caelestia\""));
+        // Without this line the module's own assertion would fail on the snippet
+        // it just told the user to paste.
+        assert!(snippet.contains("rices.niri-caelestia = inputs.niri-caelestia"));
+        assert!(snippet.contains("inputs.niri-caelestia.homeManagerModules.default"));
     }
 
     #[test]

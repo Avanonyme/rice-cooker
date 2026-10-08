@@ -176,6 +176,18 @@ pub fn kill_quickshell() -> Result<()> {
     kill_shells(&PathBuf::from(PROC_ROOT), &ShellMatcher::default())
 }
 
+/// Kill the known shells *and* whatever `extra` names.
+///
+/// A Nix rice's binary is a store path whose argv0 basename is the rice's own
+/// name, not `quickshell`, so the default matcher alone would leave a previously
+/// previewed shell running and leave two shells fighting for the same surfaces.
+pub fn kill_quickshell_with(extra: &[String]) -> Result<()> {
+    kill_shells(
+        &PathBuf::from(PROC_ROOT),
+        &ShellMatcher::with_extra(extra.iter().cloned()),
+    )
+}
+
 pub fn kill_shells(proc_root: &Path, matcher: &ShellMatcher) -> Result<()> {
     let pids = matching_pids(proc_root, matcher)?;
     if pids.is_empty() {

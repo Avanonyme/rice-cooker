@@ -100,12 +100,14 @@ repo = "https://github.com/flickowoa/dotfiles"
 commit = "92a33e776a844070bab67cd4a4a1a688b3ea6730"
 symlink_src = "quickshell"
 symlink_dst = "~/.config/quickshell/zephyr"
-# Runs on niri: measured zero `Quickshell.Hyprland` imports in the quickshell tree,
-# and quickshell renders layer surfaces through the compositor-agnostic
-# zwlr_layer_shell_v1. The single Hyprland reference in the repo is `hyprctl` in
-# `config/hypr/themes/*/scripts/apply.sh`, which is Hyprland-side theming and not
-# part of the rice.
-compositors = ["hyprland", "niri"]
+# Hyprland-only at the *pinned* revision: `rice-cooker-backend compat zephyr` finds
+# 15 of 25 files under quickshell/ using a Hyprland API, and zero niri.
+#
+# An earlier revision of this entry declared niri here, on the strength of a hand
+# scan of the repository's default branch — where quickshell/ no longer exists at
+# all, and so matched nothing. The pin is what matters, and a hand scan with a
+# narrower extension filter is not the same measurement.
+compositors = ["hyprland"]
 
 # Configuration only: no flake upstream, but `builtins.fetchGit` needs no
 # flake.nix, and the runtime is a binary-cache hit rather than a compile.

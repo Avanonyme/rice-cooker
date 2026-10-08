@@ -259,12 +259,19 @@ compositor support layer shells".
 
 Measured with the probe:
 
-| rice | `Quickshell.Hyprland` | declared |
+| rice | files with a Hyprland binding / files scanned | declared |
 |---|---|---|
-| zephyr | 0 (the lone `hyprctl` is Hyprland-side theming, outside the rice) | hyprland + **niri** |
-| linux-retroism | 1 (`taskbar/Workspaces.qml`) | hyprland |
-| whisker | 7 | hyprland |
-| nandoroid | 53 | hyprland |
+| zephyr | 15 / 25 | hyprland |
+| linux-retroism | 1 / 17 (`taskbar/Workspaces.qml`) | hyprland |
+| whisker | 18 / 154 | hyprland |
+| nandoroid | 50 / 334 | hyprland |
+
+All four are Hyprland-bound, so none declares niri. **Measure the artifact the
+catalog pins, not the repository's default branch**: zephyr's `quickshell/`
+directory does not exist at HEAD at all (the repo was restructured), so a scan of
+HEAD reports zero bindings for a tree that has 51 files at the pinned revision.
+That mistake was made and caught here — by the probe, which is the argument for it
+being a tool rather than a judgement call.
 - **T3 — runtime observation.** What `verify_argv` does today: a matching layer
   surface since the baseline, which cannot be produced without real integration.
 - **T4 — record the observation.** Persist which compositor a rice was seen

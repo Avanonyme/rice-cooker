@@ -177,6 +177,15 @@ pub struct NixDecl {
     /// independent of `build`: a rice may have either, both, or neither.
     #[serde(default)]
     pub module: Option<String>,
+    /// Where the binary that *runs* this rice's configuration comes from, as a
+    /// Nix installable, e.g. `nixpkgs#quickshell`.
+    ///
+    /// A configuration-only rice has nothing of its own to build, so without this
+    /// it depends on the user's system already providing the shell. Declaring it
+    /// means the runtime is fetched instead — and `nixpkgs#quickshell` is a plain
+    /// binary-cache hit, so that costs nothing to compile.
+    #[serde(default)]
+    pub runtime: Option<String>,
     /// An extra module required when the compositor is niri.
     ///
     /// Some rices extend their own namespace for niri rather than shipping a
@@ -601,6 +610,24 @@ fn validate_nix(name: &str, entry: &RiceEntry) -> Result<()> {
 
     if let Some(build) = nix.build.as_deref() {
         ensure_attr_path(name, "nix.build", build)?;
+    }
+    if let Some(runtime) = nix.runtime.as_deref() {
+        ensure!(!runtime.is_empty(), "{name}: nix.runtime is empty");
+        ensure!(
+            !runtime.starts_with('-'),
+            "{name}: nix.runtime must not start with '-': {runtime:?}"
+        );
+        // It is passed to `nix build`, so it gets the same treatment as a flake
+        // reference: no Nix-significant characters.
+        ensure!(
+            !runtime.contains(['"', '\'', ';', '$', '`', '\n', '\r']),
+            "{name}: nix.runtime contains a Nix-significant character: {runtime:?}"
+        );
+        let attrs = runtime.split('#').count() - 1;
+        ensure!(
+            attrs <= 1,
+            "{name}: nix.runtime takes at most one '#', got {runtime:?}"
+        );
     }
     if let Some(module) = nix.module.as_deref() {
         ensure_attr_path(name, "nix.module", module)?;
@@ -1226,6 +1253,39 @@ mod tests {
         "#;
         let err = Catalog::parse(orphan).unwrap_err().to_string();
         assert!(err.contains("relative to nix.hm_namespace"), "got: {err}");
+    }
+
+    #[test]
+    fn a_declared_runtime_is_accepted_and_validated() {
+        let base = |runtime: &str| {
+            format!(
+                r#"
+                [x]
+                display_name = "X"
+                creator_name = "x"
+                repo = "https://x"
+                commit = "0123456789abcdef0123456789abcdef01234567"
+                symlink_src = "."
+                symlink_dst = "~/.config/quickshell/x"
+                [x.nix]
+                runtime = "{runtime}"
+                "#
+            )
+        };
+        let c = Catalog::parse(&base("nixpkgs#quickshell")).unwrap();
+        assert_eq!(
+            c.get("x").unwrap().nix.as_ref().unwrap().runtime.as_deref(),
+            Some("nixpkgs#quickshell")
+        );
+        // A rice that is only configuration is previewable once the runtime is
+        // declared, since the tree plus a shell is enough to run it.
+        assert_eq!(
+            Catalog::parse(&base("nixpkgs#quickshell")).unwrap().get("x").unwrap().preview_mode(),
+            PreviewMode::QuickshellSource
+        );
+        for bad in ["-rf", "$(x)", "a#b#c", ""] {
+            assert!(Catalog::parse(&base(bad)).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

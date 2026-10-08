@@ -261,11 +261,32 @@ pub fn fetch_source(repo: &str, rev: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// Resolve a `nix.runtime` installable to a store path.
+///
+/// `nixpkgs#quickshell` is a binary-cache hit, so declaring a runtime does not
+/// mean compiling one.
+pub fn resolve_runtime(spec: &str) -> Result<PathBuf> {
+    let (flake, attr) = match spec.split_once('#') {
+        Some((flake, attr)) => (flake, attr),
+        None => (spec, "default"),
+    };
+    ensure!(!flake.is_empty(), "nix.runtime names no flake: {spec:?}");
+    build_store_path(flake, attr)
+}
+
 /// Launch argv for a rice previewed from a fetched tree.
 ///
 /// `quickshell -p <dir>` — the tree's own config directory, not a `-c <name>`
 /// lookup, because nothing was installed under `$XDG_CONFIG_HOME`.
-pub fn source_launch_argv(entry: &RiceEntry, tree: &Path) -> Result<Vec<String>> {
+///
+/// `runtime` is the shell's store path when the catalog declares one. That is the
+/// point of declaring it: otherwise this depends on the user's system already
+/// having the shell, which for a quickshell rice is a guess.
+pub fn source_launch_argv(
+    entry: &RiceEntry,
+    tree: &Path,
+    runtime: Option<&Path>,
+) -> Result<Vec<String>> {
     let src = entry
         .symlink_src
         .as_deref()
@@ -275,8 +296,20 @@ pub fn source_launch_argv(entry: &RiceEntry, tree: &Path) -> Result<Vec<String>>
         .as_ref()
         .and_then(|l| l.bin.clone())
         .unwrap_or_else(|| "quickshell".to_string());
+    let argv0 = match runtime {
+        Some(store) => {
+            let candidate = store.join("bin").join(&bin);
+            ensure!(
+                candidate.is_file(),
+                "the declared runtime has no bin/{bin}: {}",
+                store.display()
+            );
+            candidate.to_string_lossy().into_owned()
+        }
+        None => bin,
+    };
     Ok(vec![
-        bin,
+        argv0,
         "-p".to_string(),
         tree.join(src).to_string_lossy().into_owned(),
     ])
@@ -395,6 +428,16 @@ pub fn install_snippet(
          }};\n"
     ));
 
+    // A rice whose configuration is files has to have them deployed, or the
+    // snippet would record a shell selection without installing the shell.
+    if let Some((key, source)) = home_file_stanza(entry, name) {
+        out.push_str(
+            "\n# This rice is configuration, so it is deployed as files rather than\n\
+             # read from a module's options.\n",
+        );
+        out.push_str(&format!("{key}.source = {source};\n"));
+    }
+
     if let Some(namespace) = nix.hm_namespace.as_deref() {
         // The namespace, plus the conventional `enable`. `hm_config` is merged
         // beneath the same namespace, so the two cannot disagree.
@@ -410,6 +453,27 @@ pub fn install_snippet(
     }
 
     Ok(out)
+}
+
+/// The `xdg.configFile` / `home.file` stanza for a rice's dotfiles, if it has any.
+///
+/// Returns `(attribute path, source expression)`. The destination is mapped from
+/// the catalog's `symlink_dst`, which is the same path Arch symlinks — so the two
+/// platforms cannot disagree about where a rice's configuration lives.
+fn home_file_stanza(entry: &RiceEntry, name: &str) -> Option<(String, String)> {
+    let (src, dst) = entry.symlink()?;
+    let rel = dst.strip_prefix("~/")?;
+    let (attribute, rel) = match rel.strip_prefix(".config/") {
+        Some(rest) => ("xdg.configFile", rest),
+        None => ("home.file", rel),
+    };
+    let source = if src == "." {
+        format!("inputs.{name}")
+    } else {
+        format!("inputs.{name} + \"/{src}\"")
+    };
+    // `{:?}` quotes and escapes it, which is what a Nix attribute name needs.
+    Some((format!("{attribute}.{rel:?}"), source))
 }
 
 /// Render a TOML value as a Nix literal.
@@ -466,7 +530,7 @@ pub fn write_install_snippet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{LaunchDecl, RiceEntry};
+    use crate::catalog::{LaunchDecl, PreviewMode, RiceEntry};
 
     fn entry_with_launch(launch: Option<LaunchDecl>) -> RiceEntry {
         RiceEntry {
@@ -636,6 +700,7 @@ mod tests {
             build: Some(build.to_string()),
             flake: None,
             module: Some(module.to_string()),
+            runtime: None,
             module_niri: None,
             hm_namespace: namespace.map(str::to_string),
             hm_config: None,
@@ -685,6 +750,45 @@ mod tests {
     }
 
     #[test]
+    fn install_snippet_deploys_dotfiles_for_a_configuration_only_rice() {
+        let mut entry = entry_with_launch(None);
+        entry.symlink_src = Some("configs/quickshell".into());
+        entry.symlink_dst = Some("~/.config/quickshell/retro".into());
+        entry.nix = Some(crate::catalog::NixDecl {
+            build: None,
+            flake: None,
+            module: None,
+            runtime: Some("nixpkgs#quickshell".into()),
+            module_niri: None,
+            hm_namespace: None,
+            hm_config: None,
+            packages: vec![],
+            follows_nixpkgs: false,
+            mutable_config: false,
+            preview: None,
+            system_module: None,
+            system_module_required: false,
+        });
+        assert_eq!(entry.preview_mode(), PreviewMode::QuickshellSource);
+
+        let snippet = install_snippet(&entry, "retro", None).unwrap();
+        assert!(
+            snippet.contains("xdg.configFile.\"quickshell/retro\".source = inputs.retro + \"/configs/quickshell\";"),
+            "{snippet}"
+        );
+    }
+
+    #[test]
+    fn a_destination_outside_dot_config_uses_home_file() {
+        let mut entry = entry_with_launch(None);
+        entry.symlink_src = Some(".".into());
+        entry.symlink_dst = Some("~/wallpapers".into());
+        let (key, source) = home_file_stanza(&entry, "x").unwrap();
+        assert_eq!(key, "home.file.\"wallpapers\"");
+        assert_eq!(source, "inputs.x");
+    }
+
+    #[test]
     fn install_snippet_without_a_namespace_omits_the_enable_line() {
         let entry = nix_entry("default", "homeModules.default", None);
         let snippet = install_snippet(&entry, "x", None).unwrap();
@@ -725,7 +829,7 @@ mod tests {
         let store = store_with_bin(vec![]);
         let mut entry = entry_with_launch(None);
         entry.symlink_src = Some("configs/quickshell".into());
-        let argv = source_launch_argv(&entry, store.path()).unwrap();
+        let argv = source_launch_argv(&entry, store.path(), None).unwrap();
         assert_eq!(argv[0], "quickshell");
         assert_eq!(argv[1], "-p");
         assert_eq!(
@@ -743,7 +847,7 @@ mod tests {
         let store = store_with_bin(vec![]);
         let mut entry = entry_with_launch(None);
         entry.symlink_src = None;
-        let err = source_launch_argv(&entry, store.path()).unwrap_err().to_string();
+        let err = source_launch_argv(&entry, store.path(), None).unwrap_err().to_string();
         assert!(err.contains("symlink_src"), "got: {err}");
     }
 
@@ -771,6 +875,38 @@ mod tests {
             !on_hyprland.contains("homeModules.niri"),
             "the niri module must not be imported on Hyprland:\n{on_hyprland}"
         );
+    }
+
+    #[test]
+    fn source_launch_uses_the_declared_runtime_when_there_is_one() {
+        let store = store_with_bin(vec!["quickshell"]);
+        let mut entry = entry_with_launch(None);
+        entry.symlink_src = Some(".".into());
+        let argv = source_launch_argv(&entry, store.path(), Some(store.path())).unwrap();
+        assert_eq!(
+            argv[0],
+            store.path().join("bin/quickshell").to_string_lossy().into_owned()
+        );
+    }
+
+    #[test]
+    fn a_runtime_without_the_declared_binary_is_an_error() {
+        let store = store_with_bin(vec![]);
+        let mut entry = entry_with_launch(None);
+        entry.symlink_src = Some(".".into());
+        let err = source_launch_argv(&entry, store.path(), Some(store.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no bin/quickshell"), "got: {err}");
+    }
+
+    #[test]
+    fn runtime_spec_splits_into_a_flake_and_an_attribute() {
+        // Only the parsing is unit-testable without invoking nix; the wrong-attribute
+        // path is caught by the `ensure` in `source_launch_argv`.
+        assert_eq!("nixpkgs#quickshell".split_once('#').unwrap(), ("nixpkgs", "quickshell"));
+        let err = resolve_runtime("#quickshell").unwrap_err().to_string();
+        assert!(err.contains("names no flake"), "got: {err}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
-import styles from './ConfigPanel.module.css';
-import type { InstallConfig } from '@/shared/backend';
+import { useEffect, useRef, useState } from "react";
+import styles from "./ConfigPanel.module.css";
+import type { InstallConfig } from "@/shared/backend";
 
 interface Props {
   config: InstallConfig;
@@ -17,11 +17,14 @@ interface Props {
  */
 export function ConfigPanel({ config, onDismiss }: Props) {
   const [copied, setCopied] = useState(false);
-  const copyTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const copyTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(
+    null,
+  );
 
   useEffect(
     () => () => {
-      if (copyTimeoutRef.current !== null) window.clearTimeout(copyTimeoutRef.current);
+      if (copyTimeoutRef.current !== null)
+        window.clearTimeout(copyTimeoutRef.current);
     },
     [],
   );
@@ -30,19 +33,24 @@ export function ConfigPanel({ config, onDismiss }: Props) {
     try {
       await navigator.clipboard.writeText(config.text);
       setCopied(true);
-      if (copyTimeoutRef.current !== null) window.clearTimeout(copyTimeoutRef.current);
+      if (copyTimeoutRef.current !== null)
+        window.clearTimeout(copyTimeoutRef.current);
       copyTimeoutRef.current = window.setTimeout(() => {
         copyTimeoutRef.current = null;
         setCopied(false);
       }, 1500);
     } catch (error) {
       // The panel is the fallback: the text is on screen and selectable.
-      console.warn('[rice-cooker] clipboard write failed:', error);
+      console.warn("[rice-cooker] clipboard write failed:", error);
     }
   };
 
   return (
-    <div className={styles.wrap} role="dialog" aria-label="Configuration to adopt">
+    <div
+      className={styles.wrap}
+      role="dialog"
+      aria-label="Configuration to adopt"
+    >
       <div className={styles.panel}>
         <div className={styles.header}>
           <span className={styles.title}>add this to your configuration</span>
@@ -52,8 +60,8 @@ export function ConfigPanel({ config, onDismiss }: Props) {
         </div>
 
         <p className={styles.note}>
-          Rice Cooker cannot change a declarative system, so this is the install:
-          paste it, then rebuild.
+          Rice Cooker cannot change a declarative system, so this is the
+          install: paste it, then rebuild.
         </p>
 
         <pre className={styles.code} onClick={copy} title="click to copy">
@@ -61,9 +69,9 @@ export function ConfigPanel({ config, onDismiss }: Props) {
         </pre>
 
         <div className={styles.footer}>
-          <span className={styles.path}>{config.path ?? ''}</span>
+          <span className={styles.path}>{config.path ?? ""}</span>
           <span className={styles.copied} data-copied={copied}>
-            {copied ? 'copied' : 'click the code to copy'}
+            {copied ? "copied" : "click the code to copy"}
           </span>
         </div>
       </div>

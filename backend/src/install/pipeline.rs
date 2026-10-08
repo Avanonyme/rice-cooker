@@ -232,22 +232,24 @@ fn run_activate<W: Write>(
         return Ok(false);
     }
 
-    // A source preview launches the system's quickshell — the rice is only its
-    // configuration — so report a missing shell here rather than failing opaquely.
+    // A source preview runs the configuration against a shell. If the catalog
+    // declares where that shell comes from, it gets fetched; otherwise it has to
+    // be on PATH, and saying so here beats failing opaquely later.
+    let needs_shell_on_path = entry.nix.as_ref().is_some_and(|nix| {
+        nix.preview_mode(entry) == PreviewMode::QuickshellSource && nix.runtime.is_none()
+    });
     if platform == PlatformId::Nix
         && mode == ActivateMode::Preview
-        && entry
-            .nix
-            .as_ref()
-            .is_some_and(|nix| nix.preview_mode(entry) == PreviewMode::QuickshellSource)
+        && needs_shell_on_path
         && platform::which("quickshell").is_none()
     {
         emit_fail(
             events,
             "preflight",
             &format!(
-                "{name}: previewing this rice needs `quickshell` on PATH — the rice is \
-                 configuration only, and the shell it configures is the system's"
+                "{name}: this rice is configuration only and declares no `nix.runtime`, so \
+                 previewing it needs `quickshell` on PATH. Set `nix.runtime = \
+                 \"nixpkgs#quickshell\"` for it to be fetched instead."
             ),
             None,
         )?;
@@ -341,6 +343,7 @@ fn run_activate<W: Write>(
     // Nix builds a flake and needs neither: a Nix-packaged shell is a wrapper
     // carrying its own config path, so there is nothing to symlink.
     let mut last_tree: Option<PathBuf> = None;
+    let mut last_runtime: Option<PathBuf> = None;
     let plan: LaunchPlan = if platform == PlatformId::Nix {
         let Some(nix) = entry.nix.as_ref() else {
             // Unreachable given the preflight guard above; kept graceful so a
@@ -397,6 +400,23 @@ fn run_activate<W: Write>(
                 // Keep the tree for the argv below; no store path is recorded
                 // because nothing was built.
                 last_tree = Some(tree);
+                // A declared runtime is fetched rather than assumed to be on the
+                // user's system. `nixpkgs#quickshell` is a binary-cache hit, so
+                // this is a download rather than a compile.
+                if let Some(spec) = nix.runtime.as_deref() {
+                    match platform::resolve_runtime(spec) {
+                        Ok(store) => last_runtime = Some(store),
+                        Err(e) => {
+                            emit_fail(
+                                events,
+                                "deps",
+                                &format!("resolving nix.runtime = {spec:?}: {e:#}"),
+                                None,
+                            )?;
+                            return Ok(false);
+                        }
+                    }
+                }
                 None
             }
         };
@@ -405,7 +425,7 @@ fn run_activate<W: Write>(
         let launch_argv = match (&store_path, last_tree.as_deref()) {
             (Some(store), _) => platform::launch_argv(entry, name, store),
             (None, Some(tree)) => {
-                match platform::source_launch_argv(entry, tree) {
+                match platform::source_launch_argv(entry, tree, last_runtime.as_deref()) {
                     Ok(argv) => argv,
                     Err(e) => {
                         emit_fail(events, "launch", &format!("{e:#}"), None)?;

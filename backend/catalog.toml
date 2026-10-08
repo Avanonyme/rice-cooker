@@ -59,6 +59,11 @@ commit = "255eb6a7b5a0d26413eea8dc5f47e8d67bb4b1ff"
 symlink_src = "configs/quickshell"
 symlink_dst = "~/.config/quickshell/linux-retroism"
 
+# Configuration only: no flake upstream, but `builtins.fetchGit` needs no
+# flake.nix, and the runtime is a binary-cache hit rather than a compile.
+[linux-retroism.nix]
+runtime = "nixpkgs#quickshell"
+
 [dms]
 display_name = "DankMaterialShell"
 creator_name = "AvengeMedia"
@@ -78,6 +83,11 @@ module = "homeModules.default"
 # the compositor decides which modules are imported — known at evaluation time.
 module_niri = "homeModules.niri"
 hm_namespace = "programs.dank-material-shell"
+# The built artifact is the `dms-shell` service; the *shell* is quickshell reading
+# this rice's configuration. So the derived precedence (build outranks dotfiles)
+# would pick the wrong one, and preview is declared explicitly.
+preview = "quickshell-source"
+runtime = "nixpkgs#quickshell"
 flake = "github:AvengeMedia/DankMaterialShell/c6ed64b24e414cd4b9588b645a6345b15fa697f4"
 
 [zephyr]
@@ -87,6 +97,11 @@ repo = "https://github.com/flickowoa/dotfiles"
 commit = "92a33e776a844070bab67cd4a4a1a688b3ea6730"
 symlink_src = "quickshell"
 symlink_dst = "~/.config/quickshell/zephyr"
+
+# Configuration only: no flake upstream, but `builtins.fetchGit` needs no
+# flake.nix, and the runtime is a binary-cache hit rather than a compile.
+[zephyr.nix]
+runtime = "nixpkgs#quickshell"
 
 [caelestia]
 display_name = "Caelestia"
@@ -129,6 +144,11 @@ preview_deps = ["ttf-material-symbols-variable", "ttf-outfit"]
 # ryu-shell was removed: github.com/RyuZinOh/.dotfiles returns 404, so the entry
 # could never install. It can come back if the repository does.
 
+# Configuration only: no flake upstream, but `builtins.fetchGit` needs no
+# flake.nix, and the runtime is a binary-cache hit rather than a compile.
+[whisker.nix]
+runtime = "nixpkgs#quickshell"
+
 [nandoroid]
 display_name = "Nandoroid"
 creator_name = "na-ive"
@@ -143,6 +163,11 @@ preview_deps = ["ttf-material-symbols-variable"]
 # non-deterministically as the log grows, and the validator rejects it.
 # `[nix]` decides how the rice is realized; `[launch]` how it is started and
 # verified.
+
+# Configuration only: no flake upstream, but `builtins.fetchGit` needs no
+# flake.nix, and the runtime is a binary-cache hit rather than a compile.
+[nandoroid.nix]
+runtime = "nixpkgs#quickshell"
 
 [niri-caelestia]
 display_name = "Niri Caelestia"

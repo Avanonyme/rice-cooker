@@ -156,11 +156,34 @@ must target a *standalone* HM configuration (its own flake), not the NixOS-modul
   #1967 proposes deriving it from `WAYLAND_DISPLAY`). So detection must try
   `$NIRI_SOCKET` then reconstruct the filename above from `$WAYLAND_DISPLAY`, not
   assume the env var.
-- Upstream quickshell has **no** niri layer-shell support (quickshell issue #47, open,
-  maintainer will accept a PR but not write it). Noctalia ships `noctalia-qs`, a
-  quickshell fork that does (`import Quickshell.Niri`), and its docs list niri as
-  supported. Therefore niri support is a *rice capability*, not a universal one:
-  a rice must be able to declare the compositors it works on.
+**Correction — the original claim here was wrong.** It said upstream quickshell has
+no niri layer-shell support. Measured against the quickshell tree instead of the
+issue tracker:
+
+- **Zero niri references** in `src/` — no `Quickshell.Niri`, no niri code at all.
+- Layer surfaces are created through `zwlr_layer_shell_v1`
+  (`src/wayland/wlr_layershell/`), which is the standard, compositor-agnostic
+  protocol. **niri implements it**, so quickshell renders layer shells on niri
+  without any niri-specific support — observed here as niri-caelestia's
+  `caelestia-background`, `caelestia-drawers` and `caelestia-border-exclusion`
+  surfaces in `niri msg layers`.
+
+What quickshell lacks is niri-specific *bindings* — workspaces, windows, IPC —
+which rices work around by shelling out to `niri msg` (jutraim's `services/Niri.qml`
+does exactly that, 26 calls). So the question for a rice is not "does the
+compositor have layer-shell support" but "does this rice's configuration import a
+compositor-specific API". That is decidable by scanning the tree, which is what
+`docs/nix-architecture.md` §8 calls T2.
+
+Measured for the four configuration-only rices, by counting `Quickshell.Hyprland`
+imports:
+
+| rice | `Quickshell.Hyprland` | verdict |
+|---|---|---|
+| zephyr | 0 (the lone Hyprland use is `hyprctl` in a theme script) | renders on niri |
+| linux-retroism | 1 (`taskbar/Workspaces.qml`) | renders, taskbar breaks |
+| whisker | 7 | bars/workspaces are Hyprland-bound |
+| nandoroid | 53 | same |
 - niri layer rules are declarative in `config.kdl`, e.g.
   `layer-rule { match namespace="^noctalia-overview*"; place-within-backdrop true; }`.
 

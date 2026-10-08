@@ -16,6 +16,8 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::catalog::{LaunchKind, RiceEntry};
+
+pub use crate::catalog::PreviewMode;
 use crate::paths::Paths;
 use crate::process;
 
@@ -527,10 +529,123 @@ pub fn write_install_snippet(
     Ok(path)
 }
 
+// ── compositor compatibility (the T2 probe) ──────────────────────────────────
+
+/// Bindings found in a rice's configuration tree, counted per *file*.
+///
+/// Per file rather than per occurrence: one file importing `Quickshell.Hyprland`
+/// twelve times is one file that will fail to load on niri, not twelve.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BindingCounts {
+    pub hyprland: usize,
+    pub niri: usize,
+    /// Files examined, so a zero can be told from "nothing was scanned".
+    pub files_scanned: usize,
+}
+
+/// Substrings that mean a rice's configuration depends on a compositor's API.
+const HYPRLAND_SIGNALS: &[&str] = &["Quickshell.Hyprland", "Hyprland.", "hyprctl"];
+const NIRI_SIGNALS: &[&str] = &["niri msg", "NIRI_SOCKET", "Quickshell.Niri"];
+
+const SCAN_EXTENSIONS: &[&str] = &[
+    "qml", "js", "mjs", "ts", "sh", "fish", "bash", "py", "lua", "toml", "json", "conf", "kdl",
+];
+const SCAN_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const SCAN_MAX_FILES: usize = 20_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatVerdict {
+    /// Bindings for the declared compositor, and none for the other.
+    Supported,
+    /// No compositor-specific bindings at all. It renders, because layer shells go
+    /// through the compositor-agnostic `zwlr_layer_shell_v1`; nothing in it is
+    /// compositor-bound either way.
+    Neutral,
+    /// Bindings for the *other* compositor and none for this one: the declaration
+    /// is wrong, or the rice cannot work here.
+    Contradicts,
+    /// Bindings for both.
+    Mixed,
+}
+
+/// Walk a rice's configuration tree and count compositor bindings.
+///
+/// Point this at the rice's own config directory — `<repo>/<symlink_src>` — not at
+/// the whole repository. A dotfiles repo commonly carries `config/hypr/...` for
+/// Hyprland-side theming, and counting that would report a rice as
+/// Hyprland-bound when its quickshell tree has no Hyprland reference at all.
+pub fn scan_compositor_bindings(root: &Path) -> Result<BindingCounts> {
+    ensure!(root.is_dir(), "not a directory: {}", root.display());
+    let mut counts = BindingCounts::default();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // A symlink farm is not an error; skip what cannot be read.
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if counts.files_scanned >= SCAN_MAX_FILES {
+                return Ok(counts);
+            }
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let relevant = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| SCAN_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+            if !relevant {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() > SCAN_MAX_FILE_BYTES {
+                continue;
+            }
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                // Not UTF-8, so not configuration we can read as text.
+                continue;
+            };
+            counts.files_scanned += 1;
+            if HYPRLAND_SIGNALS.iter().any(|sig| body.contains(sig)) {
+                counts.hyprland += 1;
+            }
+            if NIRI_SIGNALS.iter().any(|sig| body.contains(sig)) {
+                counts.niri += 1;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// What the evidence says about a declared compositor.
+pub fn compat_verdict(declared: crate::compositor::CompositorId, counts: &BindingCounts) -> CompatVerdict {
+    use crate::compositor::CompositorId;
+    let (this, other) = match declared {
+        CompositorId::Hyprland => (counts.hyprland, counts.niri),
+        CompositorId::Niri => (counts.niri, counts.hyprland),
+    };
+    match (this > 0, other > 0) {
+        (true, false) => CompatVerdict::Supported,
+        (false, false) => CompatVerdict::Neutral,
+        (false, true) => CompatVerdict::Contradicts,
+        (true, true) => CompatVerdict::Mixed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::{LaunchDecl, PreviewMode, RiceEntry};
+    use crate::compositor::CompositorId;
 
     fn entry_with_launch(launch: Option<LaunchDecl>) -> RiceEntry {
         RiceEntry {
@@ -807,6 +922,96 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with(home.join("data")));
         assert!(std::fs::read_to_string(&first).unwrap().contains("dms"));
+    }
+
+    /// A tree with a rice directory and, separately, Hyprland-side theming.
+    fn fixture_tree() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let rice = t.path().join("quickshell");
+        std::fs::create_dir_all(rice.join("bar")).unwrap();
+        std::fs::write(rice.join("shell.qml"), "import Quickshell\n").unwrap();
+        std::fs::write(
+            rice.join("bar/Workspaces.qml"),
+            "import Quickshell.Hyprland\nHyprland.workspaces\n",
+        )
+        .unwrap();
+        // Outside the rice: Hyprland-side theming, not the rice.
+        let theme = t.path().join("config/hypr/themes/base/scripts");
+        std::fs::create_dir_all(&theme).unwrap();
+        std::fs::write(theme.join("apply.sh"), "hyprctl keyword general:border 1\n").unwrap();
+        t
+    }
+
+    #[test]
+    fn scan_counts_bindings_per_file_within_the_rice_only() {
+        let t = fixture_tree();
+        let counts = scan_compositor_bindings(&t.path().join("quickshell")).unwrap();
+        assert_eq!(counts.hyprland, 1, "one file imports Quickshell.Hyprland");
+        assert_eq!(counts.niri, 0);
+        assert_eq!(counts.files_scanned, 2);
+
+        // Scanning the whole repo would see the theme script and misreport it.
+        let whole = scan_compositor_bindings(t.path()).unwrap();
+        assert_eq!(whole.hyprland, 2);
+    }
+
+    #[test]
+    fn scan_ignores_binaries_unreadable_and_irrelevant_files() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("logo.png"), [0xff, 0xfe, 0xfd]).unwrap();
+        std::fs::write(t.path().join("notes.txt"), "hyprctl everywhere").unwrap();
+        std::fs::write(t.path().join("shell.qml"), "import Quickshell").unwrap();
+        let counts = scan_compositor_bindings(t.path()).unwrap();
+        assert_eq!(counts.hyprland, 0, ".txt is not a config extension");
+        assert_eq!(counts.files_scanned, 1);
+    }
+
+    #[test]
+    fn a_rice_with_no_compositor_bindings_is_neutral() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("shell.qml"), "import Quickshell\n").unwrap();
+        let counts = scan_compositor_bindings(t.path()).unwrap();
+        // Neutral, not Contradicts: quickshell renders through the
+        // compositor-agnostic zwlr_layer_shell_v1, so nothing here is bound.
+        assert_eq!(compat_verdict(CompositorId::Niri, &counts), CompatVerdict::Neutral);
+        assert_eq!(compat_verdict(CompositorId::Hyprland, &counts), CompatVerdict::Neutral);
+    }
+
+    #[test]
+    fn verdict_reads_the_bindings_the_right_way_round() {
+        let hyprland_only = BindingCounts { hyprland: 3, niri: 0, files_scanned: 3 };
+        assert_eq!(
+            compat_verdict(CompositorId::Hyprland, &hyprland_only),
+            CompatVerdict::Supported
+        );
+        assert_eq!(
+            compat_verdict(CompositorId::Niri, &hyprland_only),
+            CompatVerdict::Contradicts
+        );
+
+        let niri_only = BindingCounts { hyprland: 0, niri: 2, files_scanned: 2 };
+        assert_eq!(
+            compat_verdict(CompositorId::Niri, &niri_only),
+            CompatVerdict::Supported
+        );
+        assert_eq!(
+            compat_verdict(CompositorId::Hyprland, &niri_only),
+            CompatVerdict::Contradicts
+        );
+
+        let both = BindingCounts { hyprland: 1, niri: 1, files_scanned: 2 };
+        assert_eq!(
+            compat_verdict(CompositorId::Niri, &both),
+            CompatVerdict::Mixed
+        );
+    }
+
+    #[test]
+    fn scanning_a_missing_directory_is_an_error_not_a_zero() {
+        let err = scan_compositor_bindings(Path::new("/nonexistent-rice-tree"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a directory"), "got: {err}");
     }
 
     #[test]

@@ -241,9 +241,30 @@ Four tiers, weakest to strongest:
   `niri msg`, `NIRI_SOCKET`, `Quickshell.Niri`. Measured separation:
   jutraim's `services/Niri.qml` has 26 `niri msg` calls; upstream Caelestia has
   zero niri references and 13 qml files touching `Quickshell.Hyprland`. Verdicts:
-  `Supports` / `NoEvidence` / `Contradicts`. *Not built.* Worth building before
-  T3 because eviction has already killed the user's shell by the time T3 can
-  judge — a cheap offline probe can refuse first.
+  `supported` / `neutral` / `contradicts` / `mixed`. **Built** as
+  `rice-cooker-backend compat <name>`; with no `--dir` it fetches or builds the
+  rice exactly as a preview would, and it scopes the scan to `<artifact>/<symlink_src>`
+  so Hyprland-side theming elsewhere in a dotfiles repo is not counted as part of
+  the rice.
+
+**Correction to an earlier claim in this file.** It said upstream quickshell has no
+niri layer-shell support. That is false: quickshell has zero niri-specific code,
+but its layer surfaces go through `zwlr_layer_shell_v1`
+(`src/wayland/wlr_layershell/`), which is compositor-agnostic and which niri
+implements. So quickshell **renders** on niri. What it lacks is niri-specific
+*bindings* — workspaces, windows, IPC — which rices work around by shelling out to
+`niri msg`. The question for a rice is therefore "does its configuration import a
+compositor-specific API", which is what this probe answers, not "does the
+compositor support layer shells".
+
+Measured with the probe:
+
+| rice | `Quickshell.Hyprland` | declared |
+|---|---|---|
+| zephyr | 0 (the lone `hyprctl` is Hyprland-side theming, outside the rice) | hyprland + **niri** |
+| linux-retroism | 1 (`taskbar/Workspaces.qml`) | hyprland |
+| whisker | 7 | hyprland |
+| nandoroid | 53 | hyprland |
 - **T3 — runtime observation.** What `verify_argv` does today: a matching layer
   surface since the baseline, which cannot be produced without real integration.
 - **T4 — record the observation.** Persist which compositor a rice was seen

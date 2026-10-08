@@ -66,6 +66,80 @@ fn list_prints_catalog_entries_as_json_array() {
     insta::assert_snapshot!("list_json", stdout);
 }
 
+/// `compat` scopes by `symlink_src` and needs a `[nix]` block to know there is an
+/// artifact at all, so it gets its own catalog rather than the shared one (which
+/// the `list` snapshot pins).
+fn nix_scratch() -> TempDir {
+    let t = TempDir::new().unwrap();
+    fs::write(
+        t.path().join("catalog.toml"),
+        r#"
+[one]
+display_name = "One"
+creator_name = "a"
+repo = "https://x"
+commit = "0123456789abcdef0123456789abcdef01234567"
+symlink_src = "."
+symlink_dst = "~/.config/quickshell/one"
+
+[one.nix]
+runtime = "nixpkgs#quickshell"
+"#,
+    )
+    .unwrap();
+    t
+}
+
+#[test]
+fn compat_reports_bindings_and_a_verdict() {
+    let t = nix_scratch();
+    // `one` declares no `compositors`, so it defaults to hyprland-only.
+    fs::write(
+        t.path().join("shell.qml"),
+        "import Quickshell.Hyprland\nHyprland.workspaces\n",
+    )
+    .unwrap();
+
+    let out = cmd(&t)
+        .args([
+            "--catalog",
+            t.path().join("catalog.toml").to_str().unwrap(),
+            "compat",
+            "--dir",
+            t.path().to_str().unwrap(),
+            "one",
+        ])
+        .assert()
+        .success();
+    let stdout = std::str::from_utf8(&out.get_output().stdout).unwrap();
+
+    assert!(stdout.contains(r#""hyprland": 1"#), "got: {stdout}");
+    assert!(stdout.contains(r#""niri": 0"#), "got: {stdout}");
+    // Declared hyprland-only, and hyprland bindings were found: supported, with
+    // nothing contradicting it.
+    assert!(stdout.contains(r#""verdict": "supported""#), "got: {stdout}");
+    // Two: shell.qml and the catalog itself, which is also a scanned `.toml`.
+    assert!(stdout.contains(r#""files_scanned": 2"#), "got: {stdout}");
+}
+
+#[test]
+fn compat_refuses_a_rice_with_no_artifact_to_scan() {
+    let t = nix_scratch();
+    let out = cmd(&t)
+        .args([
+            "--catalog",
+            t.path().join("catalog.toml").to_str().unwrap(),
+            "compat",
+            "--dir",
+            t.path().to_str().unwrap(),
+            "missing",
+        ])
+        .assert()
+        .failure();
+    let stderr = std::str::from_utf8(&out.get_output().stderr).unwrap();
+    assert!(stderr.contains("not in catalog"), "got: {stderr}");
+}
+
 #[test]
 fn preview_wires_to_preview_subcommand() {
     let t = scratch();

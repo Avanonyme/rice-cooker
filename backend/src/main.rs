@@ -36,6 +36,18 @@ enum Cmd {
     List,
     /// Report the detected platform, compositor and blockers (JSON).
     Env,
+    /// Report whether a rice's configuration matches the compositors it declares.
+    ///
+    /// Scans the rice's own config directory for compositor bindings and compares
+    /// them with the catalog's `compositors`. This is the measurement that decides
+    /// that field, rather than a guess.
+    Compat {
+        name: String,
+        /// An already-realized tree or store path. Without it the rice is fetched
+        /// or built, exactly as a preview would.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// Print the active rice's install record (JSON).
     Status,
 }
@@ -74,6 +86,73 @@ fn run() -> Result<bool> {
             let mut lock = stdout.lock();
             let mut events = EventWriter::new(&mut lock);
             install::run_uninstall(&paths, Flags { force: *force }, &mut events)
+        }
+        Cmd::Compat { name, dir } => {
+            let cat = Catalog::from_file(&catalog_path(&paths, cli.catalog.as_deref())?)?;
+            let Some(entry) = cat.get(name) else {
+                anyhow::bail!("{name}: not in catalog");
+            };
+            let nix = entry
+                .nix
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("{name}: no [nix] block, so there is no artifact to scan"))?;
+
+            let artifact = match dir {
+                Some(dir) => dir.clone(),
+                None => match entry.preview_mode() {
+                    platform::PreviewMode::Package => {
+                        let attr = nix
+                            .build_attr()
+                            .ok_or_else(|| anyhow::anyhow!("{name}: no nix.build to build"))?;
+                        platform::build_store_path(&nix.flake_ref(&entry.repo, &entry.commit), attr)?
+                    }
+                    platform::PreviewMode::QuickshellSource => {
+                        platform::fetch_source(&entry.repo, &entry.commit)?
+                    }
+                    platform::PreviewMode::Unsupported => anyhow::bail!(
+                        "{name}: declares no runnable artifact, so there is nothing to scan"
+                    ),
+                },
+            };
+
+            // Scope to the rice's own config directory when it has one, so
+            // Hyprland-side theming elsewhere in a dotfiles repo is not counted as
+            // part of the rice.
+            let scoped = entry
+                .symlink_src
+                .as_deref()
+                .map(|src| artifact.join(src))
+                .filter(|path| path.is_dir());
+            let scoped_to_rice = scoped.is_some();
+            let root = scoped.unwrap_or_else(|| artifact.clone());
+
+            let counts = platform::scan_compositor_bindings(&root)?;
+            let verdicts: Vec<serde_json::Value> = entry
+                .compositors
+                .iter()
+                .map(|id| {
+                    serde_json::json!({
+                        "compositor": id,
+                        "verdict": platform::compat_verdict(*id, &counts),
+                    })
+                })
+                .collect();
+
+            serde_json::to_writer_pretty(
+                std::io::stdout(),
+                &serde_json::json!({
+                    "name": name,
+                    "artifact": artifact,
+                    "scanned": root,
+                    "scope": if scoped_to_rice { "symlink_src" } else { "artifact root" },
+                    "files_scanned": counts.files_scanned,
+                    "bindings": { "hyprland": counts.hyprland, "niri": counts.niri },
+                    "declared": entry.compositors,
+                    "verdicts": verdicts,
+                }),
+            )?;
+            println!();
+            Ok(true)
         }
         Cmd::Env => {
             let report = platform::env_report();

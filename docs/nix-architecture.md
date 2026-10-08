@@ -126,6 +126,16 @@ assertion.
 entries parse unchanged with `compositors` defaulting to `["hyprland"]` — exactly
 the v1 assumption.
 
+There is **no `shape` field**: it conflated two independent questions and made
+`qs -p <dir>` look like a general answer when it only covers the quickshell
+family. Three orthogonal declarations replace it.
+
+| Axis | Field | noctalia | niri-caelestia | dms |
+|---|---|---|---|---|
+| Runnable artifact to build | `build = "default"` | yes (C++) | yes | no — it *is* quickshell config |
+| Home Manager module | `module = "homeModules.default"` | yes | yes | no |
+| Configuration files | `symlink_src` / `symlink_dst` | yes | no | yes |
+
 ```toml
 [niri-caelestia]
 repo = "https://github.com/jutraim/niri-caelestia-shell"
@@ -138,16 +148,24 @@ kind = "argv"
 argv = ["caelestia-shell"]
 
 [niri-caelestia.nix]
-shape = "package"
-package = "default"
-flake = "github:jutraim/niri-caelestia-shell/fe36491a…"
+build  = "default"                     # a runnable artifact exists
+module = "homeModules.default"         # and a Home Manager module
 hm_option = "programs.caelestia.enable"
+flake = "github:jutraim/niri-caelestia-shell/fe36491a…"
 ```
 
-Three rice shapes, dispatched rather than assumed: `module`
-(`homeManagerModules.*` — ChromaShell, noctalia), `package`
-(`packages.<system>.*` plus a launch command — amane, niri-caelestia), and
-`dotfiles` (a re-exported tree).
+`preview` is a **fourth, separate** declaration, because how a rice installs
+says nothing about whether it can run: `package` (build it, run
+`<store>/bin/<bin>`), `quickshell-source` (fetch the tree, run
+`quickshell -p <tree>/<symlink_src>`), or `unsupported` (configuration only, so a
+rebuild is the only way). It is derived when unambiguous — a `build` outranks
+dotfiles, since a compiled shell cannot run from a tree — and must be stated when
+it is not. A test refuses a bundled Nix rice whose preview would be *implicitly*
+unsupported, so the limitation is declared rather than inferred.
+
+`quickshell-source` needs `quickshell` on `PATH`: the rice is configuration, and
+the shell it configures belongs to the system. Preflight says so plainly instead
+of failing opaquely.
 
 Two parse modes: `Catalog::parse` is strict and gates CI and the bundled catalog;
 `parse_lenient` skips one bad entry so a runtime-fetched catalog cannot be broken

@@ -152,7 +152,9 @@ pub fn detect_in(root: &Path, override_flag: Option<&str>) -> Result<PlatformId>
     })
 }
 
-fn which(bin: &str) -> Option<PathBuf> {
+/// Is `bin` on `PATH`? Exposed so preflight can report a missing shell rather
+/// than failing later with something opaque.
+pub fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
@@ -214,6 +216,70 @@ pub fn build_store_path(flake_ref: &str, package_attr: &str) -> Result<PathBuf> 
         "nix build {target} returned something that is not a store path: {path:?}"
     );
     Ok(PathBuf::from(path))
+}
+
+/// Fetch a rice's tree at a pinned revision and return its store path.
+///
+/// `builtins.fetchGit` rather than `nix build`: a configuration-only rice has no
+/// derivation to build, and its tree still has to land in the store. Impure, and
+/// deliberately so — the revision is pinned by the catalog, so the result is
+/// still deterministic.
+pub fn fetch_source(repo: &str, rev: &str) -> Result<PathBuf> {
+    for (label, value) in [("url", repo), ("rev", rev)] {
+        ensure!(
+            !value.is_empty(),
+            "fetch_source: {label} is empty"
+        );
+        ensure!(
+            !value.contains(['"', '\'', ';', '$', '`', '\\', '\n', '\r']),
+            "fetch_source: refusing {label} containing a Nix-significant character: {value:?}"
+        );
+    }
+    let expr = format!("builtins.fetchGit {{ url = \"{repo}\"; rev = \"{rev}\"; }}");
+    eprintln!("fetch_source: nix eval --impure {expr}");
+
+    let mut child = Command::new("nix")
+        .args(["eval", "--raw", "--impure", "--expr", &expr])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("spawning nix eval")?;
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)
+            .context("reading nix eval stdout")?;
+    }
+    let status = child.wait().context("waiting for nix eval")?;
+    if !status.success() {
+        bail!("fetching {repo}@{rev} failed (exit {:?})", status.code());
+    }
+    let path = stdout.trim();
+    ensure!(
+        path.starts_with("/nix/store/"),
+        "fetching {repo}@{rev} returned something that is not a store path: {path:?}"
+    );
+    Ok(PathBuf::from(path))
+}
+
+/// Launch argv for a rice previewed from a fetched tree.
+///
+/// `quickshell -p <dir>` — the tree's own config directory, not a `-c <name>`
+/// lookup, because nothing was installed under `$XDG_CONFIG_HOME`.
+pub fn source_launch_argv(entry: &RiceEntry, tree: &Path) -> Result<Vec<String>> {
+    let src = entry
+        .symlink_src
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("previewing from a tree needs symlink_src"))?;
+    let bin = entry
+        .launch
+        .as_ref()
+        .and_then(|l| l.bin.clone())
+        .unwrap_or_else(|| "quickshell".to_string());
+    Ok(vec![
+        bin,
+        "-p".to_string(),
+        tree.join(src).to_string_lossy().into_owned(),
+    ])
 }
 
 /// Derive the launch argv from the catalog entry, resolved against the store path.
@@ -495,6 +561,48 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with(home.join("data")));
         assert!(std::fs::read_to_string(&first).unwrap().contains("dms"));
+    }
+
+    #[test]
+    fn fetch_source_refuses_nix_significant_characters() {
+        for bad in [
+            ("https://x/\"y", "rev"),
+            ("https://x/y; rm -rf /", "rev"),
+            ("https://x/y", "0123\"456"),
+            ("https://x/y", "$(whoami)"),
+        ] {
+            let err = fetch_source(bad.0, bad.1).unwrap_err().to_string();
+            assert!(err.contains("refusing"), "{bad:?}: got {err}");
+        }
+        let err = fetch_source("", "abc").unwrap_err().to_string();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn source_launch_points_quickshell_at_the_tree() {
+        let store = store_with_bin(vec![]);
+        let mut entry = entry_with_launch(None);
+        entry.symlink_src = Some("configs/quickshell".into());
+        let argv = source_launch_argv(&entry, store.path()).unwrap();
+        assert_eq!(argv[0], "quickshell");
+        assert_eq!(argv[1], "-p");
+        assert_eq!(
+            argv[2],
+            store
+                .path()
+                .join("configs/quickshell")
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    #[test]
+    fn source_launch_without_a_source_dir_is_an_error() {
+        let store = store_with_bin(vec![]);
+        let mut entry = entry_with_launch(None);
+        entry.symlink_src = None;
+        let err = source_launch_argv(&entry, store.path()).unwrap_err().to_string();
+        assert!(err.contains("symlink_src"), "got: {err}");
     }
 
     #[test]

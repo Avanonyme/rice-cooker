@@ -63,11 +63,13 @@ pub struct RiceEntry {
     /// full 40-hex revision or a non-hex ref name; see `validate_nix`.
     pub commit: String,
     /// Source path installed by the symlink step, relative to the clone dir.
-    /// Required for Arch entries and for `nix.shape = "dotfiles"`.
+    /// Required for Arch entries, and used by Nix as the declaration of which
+    /// directory holds a rice's configuration files.
     #[serde(default)]
     pub symlink_src: Option<String>,
     /// Symlink destination, `~`-expanded. Must stay under `$HOME`.
-    /// Required for Arch entries and for `nix.shape = "dotfiles"`.
+    /// Required for Arch entries, and used by Nix as the declaration of which
+    /// directory holds a rice's configuration files.
     #[serde(default)]
     pub symlink_dst: Option<String>,
     /// True when the package installs a Quickshell config discoverable by `-c`.
@@ -131,15 +133,48 @@ pub enum LaunchKind {
     Argv,
 }
 
+/// How a rice can be *previewed* on Nix.
+///
+/// Deliberately separate from how the rice is *installed* (`build`, `module` and
+/// the dotfiles pair).
+/// The two are independent: noctalia is a `module` rice that has to be built
+/// (`preview = "package"`), while a quickshell dotfiles rice is a `dotfiles`
+/// install that previews by fetching a tree. Deriving one from the other is what
+/// made "fetch the source and run `quickshell -p`" look like a general answer
+/// when it only covers the quickshell family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewMode {
+    /// Build the flake and run `<store>/bin/<bin>` — anything with a runnable
+    /// artifact, compiled shells included.
+    Package,
+    /// Fetch the tree and run the launcher against the fetched source. Only valid
+    /// for a shell that can run from a config directory, i.e. quickshell.
+    QuickshellSource,
+    /// No runnable artifact: the rice exists only as configuration, so it can be
+    /// installed but never previewed without a rebuild. Declaring this is the
+    /// point — it makes the limitation explicit instead of a runtime failure.
+    Unsupported,
+}
+
 /// Nix-side declaration for a rice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NixDecl {
-    pub shape: NixShape,
+    /// Attribute under `packages.<system>` to build, e.g. `"default"`.
+    ///
+    /// Presence means this rice has a **runnable artifact**. Absence is normal and
+    /// not a defect: a rice that is pure quickshell configuration has no program
+    /// of its own to build.
+    #[serde(default)]
+    pub build: Option<String>,
     /// Flake reference. Defaults to `<repo>/<commit>`.
     #[serde(default)]
     pub flake: Option<String>,
-    /// `homeManagerModules.<this>` attribute path. Required for `shape = "module"`.
+    /// `homeManagerModules.<this>` attribute path, e.g. `"homeModules.default"`.
+    ///
+    /// A module is one way to supply both the program and its configuration. It is
+    /// independent of `build`: a rice may have either, both, or neither.
     #[serde(default)]
     pub module: Option<String>,
     /// This rice's own enable option, as a dotted path, e.g.
@@ -151,9 +186,6 @@ pub struct NixDecl {
     /// shell whose module was never imported.
     #[serde(default)]
     pub hm_option: Option<String>,
-    /// The attribute under `packages.<system>`. Defaults to `default`.
-    #[serde(default)]
-    pub package: Option<String>,
     /// Extra nixpkgs attribute paths to add to `home.packages`.
     #[serde(default)]
     pub packages: Vec<String>,
@@ -165,6 +197,10 @@ pub struct NixDecl {
     /// store path will not do; activation stages a writable copy.
     #[serde(default)]
     pub mutable_config: bool,
+    /// How to preview this rice. Defaults are derived from `shape` where that is
+    /// unambiguous, so an entry that can be previewed differently must say so.
+    #[serde(default)]
+    pub preview: Option<PreviewMode>,
     /// Informational: the flake's NixOS module, if any. Never applied — see
     /// `system_module_required`.
     #[serde(default)]
@@ -180,18 +216,37 @@ pub struct NixDecl {
     pub hm_config: Option<toml::Table>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NixShape {
-    /// Flake exposes `homeManagerModules.*`.
-    Module,
-    /// Flake exposes `packages.<system>.*` plus a launch command.
-    Package,
-    /// Flake re-exports a dotfiles tree, deployed with `xdg.configFile`.
-    Dotfiles,
-}
-
 impl NixDecl {
+    /// The preview mode, defaulted from `shape` where derivable.
+    ///
+    /// `module` defaults to `Unsupported` because having a Home Manager module
+    /// says nothing about whether there is a binary to run — but a NixOS
+    /// activation *does* need one, and `install` does not. So it must be declared.
+    pub fn preview_mode(&self, entry: &RiceEntry) -> PreviewMode {
+        if let Some(preview) = self.preview {
+            return preview;
+        }
+        // A buildable artifact is the only thing that can be launched from a
+        // store path.
+        if self.build.is_some() {
+            return PreviewMode::Package;
+        }
+        // Otherwise the rice is configuration, so it can be previewed only if
+        // `symlink_src` names a directory a shell can be pointed at.
+        if entry.symlink_src.is_some() {
+            return PreviewMode::QuickshellSource;
+        }
+        PreviewMode::Unsupported
+    }
+
+    /// Whether any Nix realization is declared at all.
+    ///
+    /// Deliberately not a check on `build`: a configuration-only rice is still
+    /// installable, it just cannot be previewed.
+    pub fn is_declared(&self, entry: &RiceEntry) -> bool {
+        self.build.is_some() || self.module.is_some() || entry.symlink_src.is_some()
+    }
+
     /// The flake reference to lock, defaulting to `<repo>/<commit>`.
     pub fn flake_ref(&self, repo: &str, commit: &str) -> String {
         match self.flake.as_deref() {
@@ -200,12 +255,24 @@ impl NixDecl {
         }
     }
 
-    pub fn package_attr(&self) -> &str {
-        self.package.as_deref().unwrap_or("default")
+    /// The `packages.<system>` attribute, when the rice has one to build.
+    pub fn build_attr(&self) -> Option<&str> {
+        self.build.as_deref()
     }
 }
 
 impl RiceEntry {
+    /// How this entry can be previewed on Nix.
+    ///
+    /// `Unsupported` for a non-Nix entry, which is honest: it has no Nix
+    /// realization to preview.
+    pub fn preview_mode(&self) -> PreviewMode {
+        self.nix
+            .as_ref()
+            .map(|nix| nix.preview_mode(self))
+            .unwrap_or(PreviewMode::Unsupported)
+    }
+
     /// Whether this entry can be installed at all, per platform.
     pub fn is_nix(&self) -> bool {
         self.nix.is_some()
@@ -219,7 +286,11 @@ impl RiceEntry {
     pub fn install_is_supported(&self, platform: crate::platform::PlatformId) -> bool {
         match platform {
             crate::platform::PlatformId::Arch => !self.install_deps.is_empty(),
-            crate::platform::PlatformId::Nix => self.nix.is_some(),
+            // A `[nix]` block that declares nothing is not installable; asking
+            // `is_some` alone would report an empty block as supported.
+            crate::platform::PlatformId::Nix => {
+                self.nix.as_ref().is_some_and(|nix| nix.is_declared(self))
+            }
         }
     }
 
@@ -229,7 +300,7 @@ impl RiceEntry {
 
     /// The symlink pair to install, when this entry has one.
     ///
-    /// `None` for a `nix.shape = "package"` entry, which links nothing into
+    /// `None` for a Nix entry that declares no dotfiles, which links nothing into
     /// `$XDG_CONFIG_HOME`. Validation guarantees the two fields are present or
     /// absent together, so this never yields a half pair.
     pub fn symlink(&self) -> Option<(&str, &str)> {
@@ -387,10 +458,10 @@ fn validate_entry(name: &str, entry: &RiceEntry) -> Result<()> {
     // data: they are orthogonal, and a rice may need both. noctalia is exactly
     // that — symlinked into `quickshell/` on Arch, imported as a module on Nix.
     // Only `dotfiles` *requires* them, because that shape realizes by linking.
-    let needs_symlink = match &entry.nix {
-        None => true,
-        Some(nix) => nix.shape == NixShape::Dotfiles,
-    };
+    // Arch realizes by symlink, so it needs the pair. A Nix entry may use the
+    // symlink pair as its dotfiles declaration, or a build, or a module, in any
+    // combination — `NixDecl::is_declared` is what requires it to say *something*.
+    let needs_symlink = entry.nix.is_none();
     match (&entry.symlink_src, &entry.symlink_dst) {
         (None, None) if !needs_symlink => {}
         (None, _) | (_, None) => bail!(
@@ -400,6 +471,26 @@ fn validate_entry(name: &str, entry: &RiceEntry) -> Result<()> {
             validate_symlink_src(name, src)?;
             validate_symlink_dst(name, dst)?;
         }
+    }
+
+    // Previewing from a fetched tree needs a directory inside it to point at.
+    // Checked here rather than with the other `[nix]` rules because it depends on
+    // the symlink pair above having been settled.
+    if let Some(nix) = &entry.nix
+        && nix.preview_mode(entry) == PreviewMode::QuickshellSource
+        && entry.symlink_src.is_none()
+    {
+        bail!(
+            "{name}: preview = \"quickshell-source\" requires symlink_src, which names the \
+             config directory inside the fetched tree"
+        );
+    }
+    if let Some(nix) = &entry.nix {
+        ensure!(
+            nix.is_declared(entry),
+            "{name}: the [nix] block declares nothing to install — give it build, module \
+             or symlink_src"
+        );
     }
 
     Ok(())
@@ -484,21 +575,11 @@ fn validate_nix(name: &str, entry: &RiceEntry) -> Result<()> {
         "{name}: flake reference contains a character that cannot appear in a flake URL: {flake:?}"
     );
 
-    match nix.shape {
-        NixShape::Module => {
-            let module = nix
-                .module
-                .as_deref()
-                .filter(|m| !m.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("{name}: nix.shape = \"module\" requires nix.module")
-                })?;
-            ensure_attr_path(name, "nix.module", module)?;
-        }
-        NixShape::Package => {
-            ensure_attr_path(name, "nix.package", nix.package_attr())?;
-        }
-        NixShape::Dotfiles => {}
+    if let Some(build) = nix.build.as_deref() {
+        ensure_attr_path(name, "nix.build", build)?;
+    }
+    if let Some(module) = nix.module.as_deref() {
+        ensure_attr_path(name, "nix.module", module)?;
     }
 
     for package in &nix.packages {
@@ -577,7 +658,7 @@ mod tests {
         argv = ["noctalia"]
 
         [noctalia.nix]
-        shape = "module"
+        build = "default"
         module = "homeModules.default"
         system_module = "nixosModules.default"
         packages = ["cliphist", "wl-clipboard"]
@@ -763,14 +844,13 @@ mod tests {
         assert_eq!(launch.argv, vec!["noctalia"]);
 
         let nix = e.nix.as_ref().unwrap();
-        assert_eq!(nix.shape, NixShape::Module);
         assert_eq!(nix.module.as_deref(), Some("homeModules.default"));
         assert_eq!(nix.system_module.as_deref(), Some("nixosModules.default"));
         assert!(!nix.system_module_required);
         assert!(nix.follows_nixpkgs);
         assert!(!nix.mutable_config);
         assert_eq!(nix.packages, vec!["cliphist", "wl-clipboard"]);
-        assert_eq!(nix.package_attr(), "default");
+        assert_eq!(nix.build_attr(), Some("default"));
         let hm = nix.hm_config.as_ref().unwrap();
         assert!(hm.contains_key("programs"));
 
@@ -803,44 +883,84 @@ mod tests {
             kind = "argv"
             argv = ["amane"]
             [amane.nix]
-            shape = "package"
+            build = "default"
             flake = "github:MystiaFin/amane"
         "#;
         let c = Catalog::parse(t).unwrap();
         let e = c.get("amane").unwrap();
         let nix = e.nix.as_ref().unwrap();
         assert_eq!(nix.flake_ref(&e.repo, &e.commit), "github:MystiaFin/amane");
-        assert_eq!(nix.shape, NixShape::Package);
-        assert_eq!(nix.package_attr(), "default");
+        assert_eq!(nix.build_attr(), Some("default"));
+        assert_eq!(nix.build_attr(), Some("default"));
         assert!(e.symlink_src.is_none(), "package rice links nothing");
     }
 
     #[test]
-    fn dotfiles_rice_requires_symlink_fields() {
-        let missing = r#"
+    fn a_nix_block_must_declare_something() {
+        // Previously this was phrased as "dotfiles needs symlink_src". Now the
+        // rule is the one that actually matters: a `[nix]` block that declares
+        // neither a build, a module nor dotfiles installs nothing.
+        for empty in ["", "preview = \"package\""] {
+            let t = format!(
+                r#"
+                [dots]
+                display_name = "Dots"
+                creator_name = "x"
+                repo = "https://x"
+                commit = "0123456789abcdef0123456789abcdef01234567"
+                [dots.nix]
+                {empty}
+                "#
+            );
+            let err = Catalog::parse(&t).unwrap_err().to_string();
+            assert!(err.contains("declares nothing"), "got: {err}");
+        }
+
+        // Any one of the three is enough.
+        for one in [
+            "build = \"default\"",
+            "module = \"homeModules.default\"",
+        ] {
+            let t = format!(
+                r#"
+                [dots]
+                display_name = "Dots"
+                creator_name = "x"
+                repo = "https://x"
+                commit = "0123456789abcdef0123456789abcdef01234567"
+                [dots.nix]
+                {one}
+                "#
+            );
+            assert!(Catalog::parse(&t).is_ok(), "rejected {one}");
+        }
+        // Dotfiles alone count too.
+        let t = r#"
             [dots]
             display_name = "Dots"
             creator_name = "x"
             repo = "https://x"
             commit = "0123456789abcdef0123456789abcdef01234567"
+            symlink_src = "."
+            symlink_dst = "~/.config/quickshell/dots"
             [dots.nix]
-            shape = "dotfiles"
         "#;
-        let err = Catalog::parse(missing).unwrap_err().to_string();
-        assert!(err.contains("symlink_src and symlink_dst"), "got: {err}");
+        assert!(Catalog::parse(t).is_ok());
     }
 
     #[test]
-    fn arch_symlink_fields_are_orthogonal_to_the_nix_shape() {
-        // A rice can be symlinked into place on Arch *and* imported as a module
-        // on Nix. Refusing the combination would have excluded noctalia, which is
-        // exactly that, and whose Arch entry predates its Nix one.
-        for shape in ["package", "module"] {
-            let extra = if shape == "module" {
-                "module = \"homeModules.default\"\n"
-            } else {
-                ""
-            };
+    fn the_dotfiles_pair_is_orthogonal_to_build_and_module() {
+        // A rice can be symlinked into place on Arch *and* built *and* imported as
+        // a module. noctalia is all three at once, and refusing any combination
+        // would exclude it.
+        for (label, extra) in [
+            ("build", "build = \"default\"\n"),
+            ("module", "module = \"homeModules.default\"\n"),
+            (
+                "both",
+                "build = \"default\"\nmodule = \"homeModules.default\"\n",
+            ),
+        ] {
             let t = format!(
                 r#"
                 [p]
@@ -851,14 +971,21 @@ mod tests {
                 symlink_src = "."
                 symlink_dst = "~/.config/x"
                 [p.nix]
-                shape = "{shape}"
                 {extra}
                 "#
             );
-            let c = Catalog::parse(&t).unwrap_or_else(|e| panic!("{shape}: {e:#}"));
+            let c = Catalog::parse(&t).unwrap_or_else(|e| panic!("{label}: {e:#}"));
             let entry = c.get("p").unwrap();
-            assert!(entry.links_into_config(), "{shape}: the symlink must survive");
+            assert!(entry.links_into_config(), "{label}: the symlink must survive");
             assert_eq!(entry.symlink(), Some((".", "~/.config/x")));
+            // A build outranks dotfiles for previewing, and that precedence is
+            // the one that matters: a compiled shell cannot run from a tree.
+            let expected = if label == "module" {
+                PreviewMode::QuickshellSource
+            } else {
+                PreviewMode::Package
+            };
+            assert_eq!(entry.preview_mode(), expected, "{label}");
         }
     }
 
@@ -872,7 +999,6 @@ mod tests {
             commit = "0123456789abcdef0123456789abcdef01234567"
             symlink_src = "."
             [p.nix]
-            shape = "module"
             module = "homeModules.default"
         "#;
         let err = Catalog::parse(t).unwrap_err().to_string();
@@ -888,7 +1014,7 @@ mod tests {
             repo = "https://x"
             commit = "d7b68652e79b"
             [x.nix]
-            shape = "package"
+            build = "default"
         "#;
         let err = Catalog::parse(t).unwrap_err().to_string();
         assert!(err.contains("full 40-character revision"), "got: {err}");
@@ -903,13 +1029,15 @@ mod tests {
             repo = "https://x"
             commit = "stable"
             [x.nix]
-            shape = "package"
+            build = "default"
         "#;
         assert!(Catalog::parse(t).is_ok());
     }
 
     #[test]
-    fn module_shape_requires_a_module_attr() {
+    fn a_module_without_a_build_installs_but_cannot_be_previewed() {
+        // Having a Home Manager module says nothing about there being a binary to
+        // run, which is exactly why `preview` is its own declaration.
         let t = r#"
             [x]
             display_name = "X"
@@ -917,10 +1045,116 @@ mod tests {
             repo = "https://x"
             commit = "0123456789abcdef0123456789abcdef01234567"
             [x.nix]
-            shape = "module"
+            module = "homeModules.default"
+        "#;
+        let c = Catalog::parse(t).unwrap();
+        let e = c.get("x").unwrap();
+        assert_eq!(e.preview_mode(), PreviewMode::Unsupported);
+        assert!(e.install_is_supported(crate::platform::PlatformId::Nix));
+    }
+
+    #[test]
+    fn preview_mode_is_derived_from_what_is_declared() {
+        let base = |extra: &str| {
+            format!(
+                r#"
+                [x]
+                display_name = "X"
+                creator_name = "x"
+                repo = "https://x"
+                commit = "0123456789abcdef0123456789abcdef01234567"
+                symlink_src = "."
+                symlink_dst = "~/.config/quickshell/x"
+                [x.nix]
+                {extra}
+                "#
+            )
+        };
+        let mode = |extra: &str| {
+            Catalog::parse(&base(extra))
+                .unwrap()
+                .get("x")
+                .unwrap()
+                .preview_mode()
+        };
+        // A build outranks dotfiles: a compiled shell cannot run from a tree.
+        assert_eq!(mode("build = \"default\""), PreviewMode::Package);
+        // Dotfiles alone means configuration for a shell that already exists.
+        assert_eq!(mode(""), PreviewMode::QuickshellSource);
+        // A module plus dotfiles previews from the fetched tree...
+        assert_eq!(
+            mode("module = \"homeModules.default\""),
+            PreviewMode::QuickshellSource
+        );
+        // ...but a module with neither a build nor dotfiles has nothing to run.
+        let bare = r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            [x.nix]
+            module = "homeModules.default"
+        "#;
+        assert_eq!(
+            Catalog::parse(bare).unwrap().get("x").unwrap().preview_mode(),
+            PreviewMode::Unsupported
+        );
+    }
+
+    #[test]
+    fn a_module_rice_can_declare_a_package_preview() {
+        // noctalia: a `module` install whose shell is C++ and must be built.
+        let t = r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            [x.nix]
+            module = "homeModules.default"
+            preview = "package"
+        "#;
+        let c = Catalog::parse(t).unwrap();
+        assert_eq!(
+            c.get("x").unwrap().preview_mode(),
+            PreviewMode::Package
+        );
+    }
+
+    #[test]
+    fn quickshell_source_requires_a_config_directory() {
+        let t = r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            [x.nix]
+            module = "homeModules.default"
+            preview = "quickshell-source"
         "#;
         let err = Catalog::parse(t).unwrap_err().to_string();
-        assert!(err.contains("requires nix.module"), "got: {err}");
+        assert!(err.contains("requires symlink_src"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unsupported_preview_is_declarable() {
+        let t = r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            [x.nix]
+            module = "homeModules.default"
+            preview = "unsupported"
+        "#;
+        let c = Catalog::parse(t).unwrap();
+        assert_eq!(
+            c.get("x").unwrap().preview_mode(),
+            PreviewMode::Unsupported
+        );
     }
 
     #[test]
@@ -932,7 +1166,7 @@ mod tests {
             repo = "https://x"
             commit = "0123456789abcdef0123456789abcdef01234567"
             [x.nix]
-            shape = "package"
+            build = "default"
             hm_option = "programs.caelestia.enable"
         "#;
         let c = Catalog::parse(t).unwrap();
@@ -964,7 +1198,7 @@ mod tests {
                 repo = "https://x"
                 commit = "0123456789abcdef0123456789abcdef01234567"
                 [x.nix]
-                shape = "module"
+                module = "homeModules.default"
                 {field}
                 "#
             );
@@ -988,7 +1222,7 @@ mod tests {
                 repo = "https://x"
                 commit = "0123456789abcdef0123456789abcdef01234567"
                 [x.nix]
-                shape = "package"
+                build = "default"
                 flake = "{flake}"
                 "#
             );
@@ -1005,7 +1239,7 @@ mod tests {
             repo = "https://x"
             commit = "0123456789abcdef0123456789abcdef01234567"
             [x.nix]
-            shape = "package"
+            build = "default"
             system_module_required = true
         "#;
         let err = Catalog::parse(t).unwrap_err().to_string();
@@ -1084,6 +1318,34 @@ mod tests {
         symlink_src = "."
         symlink_dst = "~/.config/x"
     "#;
+
+    #[test]
+    fn a_nix_rice_that_cannot_be_previewed_must_say_so() {
+        // Deriving `Unsupported` silently is how "most rices don't work" turns
+        // into a runtime mystery. Every Nix entry either declares something that
+        // can be previewed, or states the limitation with `preview`.
+        let c = Catalog::parse(include_str!("../catalog.toml")).unwrap();
+        for (name, entry) in c.entries() {
+            if !entry.is_nix() {
+                continue;
+            }
+            assert!(
+                entry.install_is_supported(crate::platform::PlatformId::Nix),
+                "{name}: a [nix] block must declare build, module or dotfiles"
+            );
+            let declared = entry
+                .nix
+                .as_ref()
+                .and_then(|nix| nix.preview)
+                .is_some();
+            if !declared && entry.preview_mode() == PreviewMode::Unsupported {
+                panic!(
+                    "{name}: preview would be Unsupported; declare `preview = \"unsupported\"` \
+                     so the limitation is stated rather than inferred"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_bundled_catalog_parses_strictly() {

@@ -1,8 +1,11 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// 2: added [`Event::Config`]. `install` on a declarative platform no longer
+/// activates anything, so it has to hand the user the configuration instead.
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub struct EventWriter<W: Write> {
     inner: W,
@@ -32,6 +35,17 @@ pub enum Event {
         step: Step,
         state: StepState,
     },
+    /// The configuration a `install` produced, rendered for display.
+    ///
+    /// On a declarative platform `install` cannot mutate the system, so what it
+    /// produces is code the user adopts. This carries it to the UI rather than
+    /// leaving it to be found on disk.
+    Config {
+        format: ConfigFormat,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
     Success {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active: Option<String>,
@@ -44,6 +58,13 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         log_tail: Option<String>,
     },
+}
+
+/// Language of an [`Event::Config`] payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigFormat {
+    Nix,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,10 +99,10 @@ mod tests {
         let cases: &[(Event, &str)] = &[
             (
                 Event::Hello {
-                    version: 1,
+                    version: 2,
                     subcommand: "install".into(),
                 },
-                r#"{"type":"hello","version":1,"subcommand":"install"}"#,
+                r#"{"type":"hello","version":2,"subcommand":"install"}"#,
             ),
             // Pin every Step wire form.
             (
@@ -161,6 +182,22 @@ mod tests {
                 },
                 r#"{"type":"step","step":"replay","state":"start"}"#,
             ),
+            (
+                Event::Config {
+                    format: ConfigFormat::Nix,
+                    text: "programs.rice-cooker = { enable = true; };".into(),
+                    path: None,
+                },
+                r#"{"type":"config","format":"nix","text":"programs.rice-cooker = { enable = true; };"}"#,
+            ),
+            (
+                Event::Config {
+                    format: ConfigFormat::Nix,
+                    text: "x".into(),
+                    path: Some(PathBuf::from("/home/u/.local/share/rice-cooker/install-snippets/dms.nix")),
+                },
+                r#"{"type":"config","format":"nix","text":"x","path":"/home/u/.local/share/rice-cooker/install-snippets/dms.nix"}"#,
+            ),
             // Success omits None on serialize and reconstructs it via #[serde(default)].
             (
                 Event::Success {
@@ -191,7 +228,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut w = EventWriter::new(&mut buf);
         w.emit(&Event::Hello {
-            version: 1,
+            version: 2,
             subcommand: "install".into(),
         })
         .unwrap();
@@ -204,7 +241,7 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(
             out,
-            "{\"type\":\"hello\",\"version\":1,\"subcommand\":\"install\"}\n\
+            "{\"type\":\"hello\",\"version\":2,\"subcommand\":\"install\"}\n\
              {\"type\":\"step\",\"step\":\"clone\",\"state\":\"start\"}\n"
         );
     }

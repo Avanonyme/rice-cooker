@@ -9,10 +9,12 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 
-use crate::catalog::{Catalog, RiceEntry};
+use crate::catalog::{Catalog, PreviewMode, RiceEntry};
 use crate::compositor;
 use crate::deps;
-use crate::events::{Event, EventWriter, SCHEMA_VERSION as EVENT_SCHEMA_VERSION, Step, StepState};
+use crate::events::{
+    ConfigFormat, Event, EventWriter, SCHEMA_VERSION as EVENT_SCHEMA_VERSION, Step, StepState,
+};
 use crate::git;
 use crate::lock::{Lock, LockError};
 use crate::paths::{OriginalShell, Paths, expand_config_path};
@@ -177,6 +179,15 @@ fn run_activate<W: Write>(
         return Ok(false);
     }
 
+    // ── install on a declarative platform ────────────────────────────────────
+    // `install` produces configuration the user adopts; it cannot mutate the
+    // system. So it builds nothing, launches nothing, and takes no graphical
+    // session — which also means it never kills the shell you are running, and
+    // works over SSH.
+    if platform == PlatformId::Nix && mode == ActivateMode::Install {
+        return emit_install_config(paths, events, name, entry);
+    }
+
     let selected_deps = mode.deps_for(entry);
 
     step(events, Step::Preflight, StepState::Start)?;
@@ -215,6 +226,28 @@ fn run_activate<W: Write>(
             &format!(
                 "{name}: declared for Arch only (no [nix] block), so it cannot be \
                  realized on Nix"
+            ),
+            None,
+        )?;
+        return Ok(false);
+    }
+
+    // A source preview launches the system's quickshell — the rice is only its
+    // configuration — so report a missing shell here rather than failing opaquely.
+    if platform == PlatformId::Nix
+        && mode == ActivateMode::Preview
+        && entry
+            .nix
+            .as_ref()
+            .is_some_and(|nix| nix.preview_mode(entry) == PreviewMode::QuickshellSource)
+        && platform::which("quickshell").is_none()
+    {
+        emit_fail(
+            events,
+            "preflight",
+            &format!(
+                "{name}: previewing this rice needs `quickshell` on PATH — the rice is \
+                 configuration only, and the shell it configures is the system's"
             ),
             None,
         )?;
@@ -279,7 +312,7 @@ fn run_activate<W: Write>(
                         paths,
                         name,
                         entry,
-                        &nix.store_path,
+                        nix.store_path.as_deref(),
                         &nix.launch_argv,
                         Some(snippet)
                     )
@@ -307,6 +340,7 @@ fn run_activate<W: Write>(
     // Arch clones a repo and installs packages, then links a config directory.
     // Nix builds a flake and needs neither: a Nix-packaged shell is a wrapper
     // carrying its own config path, so there is nothing to symlink.
+    let mut last_tree: Option<PathBuf> = None;
     let plan: LaunchPlan = if platform == PlatformId::Nix {
         let Some(nix) = entry.nix.as_ref() else {
             // Unreachable given the preflight guard above; kept graceful so a
@@ -321,17 +355,69 @@ fn run_activate<W: Write>(
         };
         let flake = nix.flake_ref(&entry.repo, &entry.commit);
 
+        // How this rice is previewed is a declared property, not a derivation from
+        // how it installs: a compiled shell must be built, a quickshell dotfiles
+        // rice must be fetched and pointed at, and a module-only rice cannot be
+        // previewed at all.
         step(events, Step::Deps, StepState::Start)?;
-        let store_path = match platform::build_store_path(&flake, nix.package_attr()) {
-            Ok(path) => path,
-            Err(e) => {
-                emit_fail(events, "deps", &format!("{e:#}"), None)?;
+        let store_path = match nix.preview_mode(entry) {
+            PreviewMode::Unsupported => {
+                emit_fail(
+                    events,
+                    "preflight",
+                    &format!(
+                        "{name}: this rice has no runnable artifact — no `build`, and no \
+                         symlink_src to point a shell at — so it can be installed but not \
+                         previewed. Set `nix.preview` if that is wrong."
+                    ),
+                    None,
+                )?;
                 return Ok(false);
+            }
+            PreviewMode::Package => {
+                let attr = nix
+                    .build_attr()
+                    .expect("a Package preview implies a declared build attribute");
+                match platform::build_store_path(&flake, attr) {
+                    Ok(path) => Some(path),
+                    Err(e) => {
+                        emit_fail(events, "deps", &format!("{e:#}"), None)?;
+                        return Ok(false);
+                    }
+                }
+            }
+            PreviewMode::QuickshellSource => {
+                let tree = match platform::fetch_source(&entry.repo, &entry.commit) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        emit_fail(events, "deps", &format!("{e:#}"), None)?;
+                        return Ok(false);
+                    }
+                };
+                // Keep the tree for the argv below; no store path is recorded
+                // because nothing was built.
+                last_tree = Some(tree);
+                None
             }
         };
         step(events, Step::Deps, StepState::Done)?;
 
-        let launch_argv = platform::launch_argv(entry, name, &store_path);
+        let launch_argv = match (&store_path, last_tree.as_deref()) {
+            (Some(store), _) => platform::launch_argv(entry, name, store),
+            (None, Some(tree)) => {
+                match platform::source_launch_argv(entry, tree) {
+                    Ok(argv) => argv,
+                    Err(e) => {
+                        emit_fail(events, "launch", &format!("{e:#}"), None)?;
+                        return Ok(false);
+                    }
+                }
+            }
+            (None, None) => {
+                emit_fail(events, "launch", &format!("{name}: nothing to launch"), None)?;
+                return Ok(false);
+            }
+        };
         let namespaces = try_stage!(
             events,
             "preflight",
@@ -358,7 +444,7 @@ fn run_activate<W: Write>(
                 paths,
                 name,
                 entry,
-                &store_path,
+                store_path.as_deref(),
                 &launch_argv,
                 snippet_path
             )
@@ -1002,7 +1088,7 @@ fn do_record_nix(
     paths: &Paths,
     name: &str,
     entry: &RiceEntry,
-    store_path: &Path,
+    store_path: Option<&Path>,
     launch_argv: &[String],
     snippet_path: Option<PathBuf>,
 ) -> Result<()> {
@@ -1015,7 +1101,7 @@ fn do_record_nix(
         symlink_path: None,
         symlink_target: None,
         nix: Some(NixInstall {
-            store_path: store_path.to_path_buf(),
+            store_path: store_path.map(Path::to_path_buf),
             launch_argv: launch_argv.to_vec(),
             snippet_path,
         }),
@@ -1029,6 +1115,50 @@ fn do_record_nix(
 ///
 /// Not `rice_shell_alive`: that matches `quickshell -c <name>`, and a Nix shell
 /// is a store path whose argv0 basename is the rice's own binary.
+/// `install` on Nix: write the configuration, record where, and hand it to the UI.
+fn emit_install_config<W: Write>(
+    paths: &Paths,
+    events: &mut EventWriter<W>,
+    name: &str,
+    entry: &RiceEntry,
+) -> Result<bool> {
+    let snippet = try_stage!(
+        events,
+        "record",
+        platform::write_install_snippet(paths, name)
+    );
+    let text = match fs::read_to_string(&snippet) {
+        Ok(text) => text,
+        Err(e) => {
+            emit_fail(
+                events,
+                "record",
+                &format!("reading back {}: {e}", snippet.display()),
+                None,
+            )?;
+            return Ok(false);
+        }
+    };
+
+    step(events, Step::Record, StepState::Start)?;
+    try_stage!(
+        events,
+        "record",
+        do_record_nix(paths, name, entry, None, &[], Some(snippet.clone()))
+    );
+    step(events, Step::Record, StepState::Done)?;
+
+    events.emit(&Event::Config {
+        format: ConfigFormat::Nix,
+        text,
+        path: Some(snippet),
+    })?;
+    events.emit(&Event::Success {
+        active: Some(name.to_string()),
+    })?;
+    Ok(true)
+}
+
 fn shell_alive_for(nix: &NixInstall) -> Result<bool> {
     let Some(argv0) = nix.launch_argv.first() else {
         return Ok(false);

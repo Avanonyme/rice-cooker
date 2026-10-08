@@ -41,9 +41,14 @@ pub struct InstallRecord {
 #[serde(deny_unknown_fields)]
 pub struct NixInstall {
     /// The built store path the shell was launched from.
-    pub store_path: PathBuf,
+    ///
+    /// Absent for an *emitted* install: `install` on Nix produces configuration
+    /// and deliberately builds nothing, so there is no store path yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_path: Option<PathBuf>,
     /// The exact argv used, so a relaunch or a revert does not have to re-derive
     /// it from a catalog that may have changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_argv: Vec<String>,
     /// Where the adopt-this-config snippet was written, set by `install` on Nix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,7 +291,7 @@ mod tests {
         let (_t, p) = tmp_paths();
         let mut r = sample();
         r.nix = Some(NixInstall {
-            store_path: PathBuf::from("/nix/store/abc-caelestia-shell-1.0.0"),
+            store_path: Some(PathBuf::from("/nix/store/abc-caelestia-shell-1.0.0")),
             launch_argv: vec!["/nix/store/abc-caelestia-shell-1.0.0/bin/caelestia-shell".into()],
             snippet_path: None,
         });
@@ -312,11 +317,29 @@ mod tests {
     }
 
     #[test]
+    fn an_emitted_only_install_needs_no_store_path() {
+        let (_t, p) = tmp_paths();
+        let mut r = sample();
+        r.nix = Some(NixInstall {
+            store_path: None,
+            launch_argv: vec![],
+            snippet_path: Some(PathBuf::from("/home/x/.local/share/rice-cooker/install-snippets/x.nix")),
+        });
+        let path = p.record_json(&r.name).unwrap();
+        save_record(&path, &r).unwrap();
+        assert_eq!(load_record(&path).unwrap(), r);
+        // Neither absent-store-path nor empty-argv should reach the wire.
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("store_path"), "{body}");
+        assert!(!body.contains("launch_argv"), "{body}");
+    }
+
+    #[test]
     fn a_nix_record_omits_the_pacman_diff_on_the_wire() {
         let (_t, p) = tmp_paths();
         let mut r = sample();
         r.nix = Some(NixInstall {
-            store_path: PathBuf::from("/nix/store/abc-x"),
+            store_path: Some(PathBuf::from("/nix/store/abc-x")),
             launch_argv: vec!["/nix/store/abc-x/bin/x".into()],
             snippet_path: Some(PathBuf::from("/home/x/.local/share/rice-cooker/install-snippets/x.nix")),
         });

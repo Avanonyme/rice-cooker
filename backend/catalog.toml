@@ -44,7 +44,9 @@ kind = "argv"
 argv = ["noctalia"]
 
 [noctalia.nix]
-shape = "module"
+# v5 is C++ and must be built; it also has a Home Manager module. Both are true at
+# once, which is why `build` and `module` are separate fields.
+build = "default"
 module = "homeModules.default"
 hm_option = "programs.noctalia.enable"
 flake = "github:noctalia-dev/noctalia-shell/3e159ec301f8916e3bfd17c178258fa030f40e39"
@@ -139,8 +141,11 @@ kind = "argv"
 argv = ["caelestia-shell"]
 
 [niri-caelestia.nix]
-shape = "package"
-package = "default"
+build = "default"
+# Its flake exposes homeManagerModules.default, and its config is delivered as
+# `xdg.configFile."caelestia/shell.json"` from the module's own settings — it has
+# no dotfiles tree, verified at both the pinned rev and main.
+module = "homeModules.default"
 flake = "github:jutraim/niri-caelestia-shell/fe36491a77c56ac51d6cad1c6fc05f9828fad837"
 # So `programs.rice-cooker` can verify the user imported the rice's module.
 hm_option = "programs.caelestia.enable"

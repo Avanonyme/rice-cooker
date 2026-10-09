@@ -125,18 +125,20 @@ pub fn run_install<W: Write>(
     cat: &Catalog,
     paths: &Paths,
     name: &str,
+    platform: PlatformId,
     events: &mut EventWriter<W>,
 ) -> Result<bool> {
-    run_activate(cat, paths, name, ActivateMode::Install, events)
+    run_activate(cat, paths, name, ActivateMode::Install, platform, events)
 }
 
 pub fn run_preview<W: Write>(
     cat: &Catalog,
     paths: &Paths,
     name: &str,
+    platform: PlatformId,
     events: &mut EventWriter<W>,
 ) -> Result<bool> {
-    run_activate(cat, paths, name, ActivateMode::Preview, events)
+    run_activate(cat, paths, name, ActivateMode::Preview, platform, events)
 }
 
 fn run_activate<W: Write>(
@@ -144,6 +146,7 @@ fn run_activate<W: Write>(
     paths: &Paths,
     name: &str,
     mode: ActivateMode,
+    platform: PlatformId,
     events: &mut EventWriter<W>,
 ) -> Result<bool> {
     hello(events, mode.subcommand())?;
@@ -163,14 +166,6 @@ fn run_activate<W: Write>(
                 &format!("{name}: not in catalog"),
                 None,
             )?;
-            return Ok(false);
-        }
-    };
-
-    let platform = match platform::detect() {
-        Ok(platform) => platform,
-        Err(e) => {
-            emit_fail(events, "preflight", &format!("{e:#}"), None)?;
             return Ok(false);
         }
     };
@@ -311,14 +306,11 @@ fn run_activate<W: Write>(
             None => try_stage!(events, "deps", deps::missing(selected_deps)).is_empty(),
         };
         if alive && satisfied {
-            // On Nix, `install` still has to emit its artifact. Delegating rather
-            // than duplicating: the duplicated block wrote the snippet and the
-            // record but never emitted `Event::Config`, so a preview-then-install
-            // reported success and showed no configuration — the one path where
-            // the user most expects to see it.
-            if mode == ActivateMode::Install && platform == PlatformId::Nix {
-                return emit_install_config(paths, events, name, entry);
-            }
+            // A Nix *install* cannot reach here: it returns at the top of this
+            // function, before preflight, because emitting configuration needs no
+            // session. There used to be a copy of that emit logic in this branch,
+            // which was unreachable and so looked like a live path that had drifted
+            // (it omitted `Event::Config`). Deleted rather than delegated.
             events.emit(&Event::Success {
                 active: Some(name.to_string()),
             })?;
@@ -354,15 +346,15 @@ fn run_activate<W: Write>(
             )?;
             return Ok(false);
         };
-        let flake = nix.flake_ref(&entry.repo, &entry.commit);
-
-        // How this rice is previewed is a declared property, not a derivation from
-        // how it installs: a compiled shell must be built, a quickshell dotfiles
+        // How a rice is previewed is a declared property, not something derived
+        // from how it installs: a compiled shell must be built, a configuration-only
         // rice must be fetched and pointed at, and a module-only rice cannot be
-        // previewed at all.
+        // previewed at all. `platform::realize` is the one place that decides it.
         step(events, Step::Deps, StepState::Start)?;
-        let store_path = match nix.preview_mode(entry) {
+        let artifact = match nix.preview_mode(entry) {
             PreviewMode::Unsupported => {
+                // A refusal, so `preflight` rather than `deps`: the stage is
+                // observable in the event stream and means something different.
                 emit_fail(
                     events,
                     "preflight",
@@ -375,28 +367,20 @@ fn run_activate<W: Write>(
                 )?;
                 return Ok(false);
             }
-            PreviewMode::Package => {
-                let attr = nix
-                    .build_attr()
-                    .expect("a Package preview implies a declared build attribute");
-                match platform::build_store_path(&flake, attr) {
-                    Ok(path) => Some(path),
+            PreviewMode::Package | PreviewMode::QuickshellSource => {
+                match platform::realize(entry, nix) {
+                    Ok(artifact) => artifact,
                     Err(e) => {
                         emit_fail(events, "deps", &format!("{e:#}"), None)?;
                         return Ok(false);
                     }
                 }
             }
-            PreviewMode::QuickshellSource => {
-                let tree = match platform::fetch_source(&entry.repo, &entry.commit) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        emit_fail(events, "deps", &format!("{e:#}"), None)?;
-                        return Ok(false);
-                    }
-                };
-                // Keep the tree for the argv below; no store path is recorded
-                // because nothing was built.
+        };
+        let store_path = match artifact {
+            platform::Artifact::Store(path) => Some(path),
+            platform::Artifact::Tree(tree) => {
+                // Nothing was built, so no store path is recorded.
                 last_tree = Some(tree);
                 // A declared runtime is fetched rather than assumed to be on the
                 // user's system. `nixpkgs#quickshell` is a binary-cache hit, so
@@ -1520,7 +1504,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut events = EventWriter::new(&mut buf);
-            assert!(!run_install(&cat, &paths, "x", &mut events).unwrap());
+            assert!(!run_install(&cat, &paths, "x", PlatformId::Arch, &mut events).unwrap());
         }
         let out = std::str::from_utf8(&buf).unwrap();
         assert!(out.contains(r#""stage":"preflight""#));
@@ -1573,6 +1557,73 @@ mod tests {
     }
 
     #[test]
+    fn nix_install_emits_config_and_reaches_no_preflight() {
+        // Two things at once, and the second is the point: this asserts the path is
+        // *reachable without a session*, because install on Nix returns before
+        // preflight. A branch that omits `Event::Config` looked like a live drift
+        // earlier; it was unreachable, and only reachability distinguishes the two.
+        let (_t, paths) = tmp_paths();
+        let cat = Catalog::parse(
+            r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            [x.nix]
+            module = "homeModules.default"
+            hm_namespace = "programs.x"
+            "#,
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut events = EventWriter::new(&mut buf);
+            assert!(run_install(&cat, &paths, "x", PlatformId::Nix, &mut events).unwrap());
+        }
+        let out = std::str::from_utf8(&buf).unwrap();
+        assert!(out.contains(r#""type":"config""#), "no config event: {out}");
+        // The namespace plus the filled enable, which is what the user pastes.
+        assert!(out.contains("programs.x.enable = true;"), "got: {out}");
+        assert!(
+            !out.contains(r#""step":"preflight""#),
+            "install on Nix must not require a graphical session: {out}"
+        );
+        assert!(out.contains(r#""type":"success""#), "got: {out}");
+    }
+
+    #[test]
+    fn arch_install_still_refuses_without_a_session() {
+        // The other side of the same guarantee: Arch installs do preflight, and that
+        // is the difference the platform parameter makes explicit.
+        let (_t, paths) = tmp_paths();
+        let cat = Catalog::parse(
+            r#"
+            [x]
+            display_name = "X"
+            creator_name = "x"
+            repo = "https://x"
+            commit = "0123456789abcdef0123456789abcdef01234567"
+            symlink_src = "."
+            symlink_dst = "~/.config/quickshell/x"
+            install_deps = ["some-package"]
+            "#,
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut events = EventWriter::new(&mut buf);
+            assert!(!run_install(&cat, &paths, "x", PlatformId::Arch, &mut events).unwrap());
+        }
+        let out = std::str::from_utf8(&buf).unwrap();
+        assert!(out.contains(r#""step":"preflight","state":"start""#), "got: {out}");
+        assert!(out.contains("graphical_session"), "got: {out}");
+        assert!(!out.contains(r#""type":"config""#), "got: {out}");
+    }
+
+    #[test]
     fn run_install_refuses_preview_only_entry() {
         let (_t, paths) = tmp_paths();
         let cat = Catalog::parse(
@@ -1590,7 +1641,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut events = EventWriter::new(&mut buf);
-            assert!(!run_install(&cat, &paths, "x", &mut events).unwrap());
+            assert!(!run_install(&cat, &paths, "x", PlatformId::Arch, &mut events).unwrap());
         }
         let out = std::str::from_utf8(&buf).unwrap();
         assert!(out.contains(r#""subcommand":"install""#));
@@ -1605,7 +1656,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut events = EventWriter::new(&mut buf);
-            assert!(!run_preview(&cat, &paths, "x", &mut events).unwrap());
+            assert!(!run_preview(&cat, &paths, "x", PlatformId::Arch, &mut events).unwrap());
         }
         let out = std::str::from_utf8(&buf).unwrap();
         assert!(out.contains(r#""subcommand":"preview""#));
@@ -1631,7 +1682,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut events = EventWriter::new(&mut buf);
-            assert!(!run_preview(&cat, &paths, "x", &mut events).unwrap());
+            assert!(!run_preview(&cat, &paths, "x", PlatformId::Arch, &mut events).unwrap());
         }
         let out = std::str::from_utf8(&buf).unwrap();
         assert!(out.contains(r#""subcommand":"preview""#));

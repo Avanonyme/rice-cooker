@@ -66,20 +66,23 @@ fn main() -> ExitCode {
 fn run() -> Result<bool> {
     let cli = Cli::parse();
     let paths = Paths::from_env()?;
+    // Detected once, here, and passed down: the pipeline used to read the
+    // environment mid-flight, which made its behaviour untestable.
+    let platform = platform::detect()?;
     match &cli.cmd {
         Cmd::Preview { name } => {
             let cat = Catalog::from_file(&catalog_path(&paths, cli.catalog.as_deref())?)?;
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
             let mut events = EventWriter::new(&mut lock);
-            install::run_preview(&cat, &paths, name, &mut events)
+            install::run_preview(&cat, &paths, name, platform, &mut events)
         }
         Cmd::Install { name } => {
             let cat = Catalog::from_file(&catalog_path(&paths, cli.catalog.as_deref())?)?;
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
             let mut events = EventWriter::new(&mut lock);
-            install::run_install(&cat, &paths, name, &mut events)
+            install::run_install(&cat, &paths, name, platform, &mut events)
         }
         Cmd::Uninstall { force } => {
             let stdout = std::io::stdout();
@@ -97,21 +100,15 @@ fn run() -> Result<bool> {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("{name}: no [nix] block, so there is no artifact to scan"))?;
 
+            // Same decision as a preview makes, via the same function — a fourth
+            // preview mode cannot leave this caller behind.
             let artifact = match dir {
                 Some(dir) => dir.clone(),
                 None => match entry.preview_mode() {
-                    platform::PreviewMode::Package => {
-                        let attr = nix
-                            .build_attr()
-                            .ok_or_else(|| anyhow::anyhow!("{name}: no nix.build to build"))?;
-                        platform::build_store_path(&nix.flake_ref(&entry.repo, &entry.commit), attr)?
-                    }
-                    platform::PreviewMode::QuickshellSource => {
-                        platform::fetch_source(&entry.repo, &entry.commit)?
-                    }
                     platform::PreviewMode::Unsupported => anyhow::bail!(
                         "{name}: declares no runnable artifact, so there is nothing to scan"
                     ),
+                    _ => platform::realize(entry, nix)?.path().to_path_buf(),
                 },
             };
 
@@ -162,12 +159,7 @@ fn run() -> Result<bool> {
         }
         Cmd::List => {
             let cat = Catalog::from_file(&catalog_path(&paths, cli.catalog.as_deref())?)?;
-            let rows = install::list(
-                &cat,
-                &paths,
-                platform::detect()?,
-                platform::compositor_hint(),
-            )?;
+            let rows = install::list(&cat, &paths, platform, platform::compositor_hint())?;
             serde_json::to_writer_pretty(std::io::stdout(), &rows)?;
             println!();
             Ok(true)

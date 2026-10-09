@@ -317,6 +317,48 @@ pub fn source_launch_argv(
     ])
 }
 
+/// The artifact a preview or a compatibility scan works on.
+pub enum Artifact {
+    /// A built store path, for a rice that declares a `build`.
+    Store(PathBuf),
+    /// A fetched source tree, for a configuration-only rice.
+    Tree(PathBuf),
+}
+
+impl Artifact {
+    pub fn path(&self) -> &Path {
+        match self {
+            Artifact::Store(path) | Artifact::Tree(path) => path,
+        }
+    }
+}
+
+/// Obtain the artifact for a rice, dispatching on how it declares it is previewed.
+///
+/// One place decides this, so a caller cannot be left behind when a fourth
+/// `PreviewMode` appears. `PreviewMode::Unsupported` is deliberately *not* handled
+/// here: refusing is a preflight decision, and the event stage differs between a
+/// refusal and an obtain-failure, so the caller keeps that choice.
+pub fn realize(entry: &RiceEntry, nix: &crate::catalog::NixDecl) -> Result<Artifact> {
+    match nix.preview_mode(entry) {
+        PreviewMode::Package => {
+            let attr = nix
+                .build_attr()
+                .ok_or_else(|| anyhow::anyhow!("a Package preview implies a declared build"))?;
+            Ok(Artifact::Store(build_store_path(
+                &nix.flake_ref(&entry.repo, &entry.commit),
+                attr,
+            )?))
+        }
+        PreviewMode::QuickshellSource => {
+            Ok(Artifact::Tree(fetch_source(&entry.repo, &entry.commit)?))
+        }
+        PreviewMode::Unsupported => {
+            anyhow::bail!("Unsupported is a preflight refusal, not something to realize")
+        }
+    }
+}
+
 /// Derive the launch argv from the catalog entry, resolved against the store path.
 ///
 /// A bare binary name is rewritten to `<store>/bin/<name>` when present. That

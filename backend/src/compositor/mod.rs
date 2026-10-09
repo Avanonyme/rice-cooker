@@ -45,8 +45,6 @@ pub enum CompositorId {
 }
 
 impl CompositorId {
-    pub const ALL: [CompositorId; 2] = [CompositorId::Hyprland, CompositorId::Niri];
-
     pub fn as_str(self) -> &'static str {
         match self {
             CompositorId::Hyprland => "hyprland",
@@ -170,20 +168,6 @@ impl Compositor {
         }
     }
 
-    /// Whether a surface counts as ours, given the pids we launched and the
-    /// namespaces the rice declared.
-    pub fn ownership<'a>(
-        &self,
-        pids: &'a [u32],
-        declared: &'a [Regex],
-        baseline: &'a [LayerSurface],
-    ) -> Ownership<'a> {
-        Ownership {
-            pids,
-            namespaces: declared,
-            baseline,
-        }
-    }
 }
 
 /// Explicit override from `RICE_COOKER_COMPOSITOR`. Case-insensitive on the

@@ -153,7 +153,7 @@ impl Paths {
 
     pub fn set_original(&self, shell: Option<&OriginalShell>) -> Result<()> {
         let body = serde_json::to_string(&shell).context("serializing original shell")?;
-        write_line_file(&self.original_file(), &body)
+        write_atomic(&self.original_file(), format!("{body}\n").as_bytes(), false)
     }
 
     pub fn clear_original(&self) -> Result<()> {
@@ -230,32 +230,52 @@ pub fn expand_config_path(raw: &str, home: &Path, config_home: &Path) -> PathBuf
     }
 }
 
-// No parent-dir fsync: `original` is cache; next install preflight re-captures.
-fn write_line_file(path: &Path, contents: &str) -> Result<()> {
+/// Write `body` to `path` atomically: sibling tmp file, fsync, rename.
+///
+/// `sync_parent` also fsyncs the containing directory, which the durable install
+/// records need so the rename itself survives power loss. The cache file does not
+/// need it — a lost `original` is re-captured by the next install preflight — and
+/// both used to have their own near-identical copy of this.
+pub fn write_atomic(path: &Path, body: &[u8], sync_parent: bool) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{}: no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)
-        .with_context(|| format!("opening {}", tmp.display()))?;
-    let res = f
-        .write_all(contents.as_bytes())
-        .and_then(|_| f.write_all(b"\n"))
-        .and_then(|_| f.sync_all());
-    if let Err(e) = res {
+
+    let write_then_rename = || -> Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .with_context(|| format!("opening {}", tmp.display()))?;
+        f.write_all(body)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+        drop(f);
+        fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
+    };
+
+    if let Err(e) = write_then_rename() {
         let _ = fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+        return Err(e);
     }
-    drop(f);
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()));
+
+    // Only a warning: the content is durable by now, and failing here would desync
+    // the record from `current.json`.
+    if sync_parent
+        && let Err(e) = fs::File::open(parent).and_then(|d| d.sync_all())
+    {
+        eprintln!(
+            "rice-cooker: warn: fsync {}: {e} (file content is durable; rename may not survive power loss)",
+            parent.display()
+        );
     }
     Ok(())
 }

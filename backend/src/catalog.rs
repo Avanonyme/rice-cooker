@@ -306,11 +306,6 @@ impl RiceEntry {
             .unwrap_or(PreviewMode::Unsupported)
     }
 
-    /// Whether this entry can be installed at all, per platform.
-    pub fn is_nix(&self) -> bool {
-        self.nix.is_some()
-    }
-
     /// Whether `install` can do anything meaningful here.
     ///
     /// Arch: there must be dependency work to do (upstream PR #16's rule). Nix:
@@ -751,7 +746,7 @@ mod tests {
         assert!(e.layer_namespaces.is_empty());
         assert!(e.launch.is_none());
         assert!(e.nix.is_none());
-        assert!(!e.is_nix());
+        assert!(e.nix.is_none());
     }
 
     #[test]
@@ -897,7 +892,7 @@ mod tests {
         let e = c.get("noctalia").unwrap();
         assert_eq!(e.compositors, vec![CompositorId::Hyprland, CompositorId::Niri]);
         assert_eq!(e.layer_namespaces, vec!["^noctalia-"]);
-        assert!(e.is_nix());
+        assert!(e.nix.is_some());
 
         let launch = e.launch.as_ref().unwrap();
         assert_eq!(launch.kind, LaunchKind::Argv);
@@ -1457,7 +1452,7 @@ mod tests {
         // can be previewed, or states the limitation with `preview`.
         let c = Catalog::parse(include_str!("../catalog.toml")).unwrap();
         for (name, entry) in c.entries() {
-            if !entry.is_nix() {
+            if entry.nix.is_none() {
                 continue;
             }
             assert!(

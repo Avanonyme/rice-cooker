@@ -20,11 +20,7 @@ const LOG_TAIL_LINES: usize = 20;
 /// The compositor is detected here rather than assumed, so a niri session is a
 /// first-class target and not a failure.
 pub struct Session {
-    pub runtime_dir: PathBuf,
-    pub wayland_display: Option<String>,
     pub compositor: Compositor,
-    /// Kept so callers can pass it on without re-reading the environment.
-    pub env: SessionEnv,
 }
 
 impl Session {
@@ -58,12 +54,7 @@ pub fn check_graphical_session() -> Result<Session> {
     let _ = fs::remove_dir(&probe);
 
     let compositor = Compositor::detect(&env)?;
-    Ok(Session {
-        runtime_dir: runtime,
-        wayland_display: env.wayland_display.clone(),
-        compositor,
-        env,
-    })
+    Ok(Session { compositor })
 }
 
 pub fn kill_notif_daemons() -> Result<()> {
@@ -172,10 +163,6 @@ impl ShellMatcher {
 /// Signals pids discovered from `/proc` rather than using `pkill -x`, because
 /// `-x` matches `comm`, which the kernel truncates to 15 characters — so
 /// `.quickshell-wrapped` and store-path argv0 binaries never match.
-pub fn kill_quickshell() -> Result<()> {
-    kill_shells(&PathBuf::from(PROC_ROOT), &ShellMatcher::default())
-}
-
 /// Kill the known shells *and* whatever `extra` names.
 ///
 /// A Nix rice's binary is a store path whose argv0 basename is the rice's own
@@ -1011,19 +998,8 @@ mod tests {
     fn session_reports_its_compositor_id() {
         use crate::compositor::CompositorId;
         let s = Session {
-            runtime_dir: PathBuf::from("/run/user/1000"),
-            wayland_display: Some("wayland-1".into()),
             compositor: Compositor::Niri {
                 socket: PathBuf::from("/run/user/1000/niri.wayland-1.9.sock"),
-            },
-            env: SessionEnv {
-                runtime_dir: PathBuf::from("/run/user/1000"),
-                wayland_display: Some("wayland-1".into()),
-                hyprland_signature: None,
-                niri_socket: None,
-                current_desktop: Some("niri".into()),
-                compositor_override: None,
-                proc_root: PathBuf::from("/proc"),
             },
         };
         assert_eq!(s.compositor_id(), CompositorId::Niri);

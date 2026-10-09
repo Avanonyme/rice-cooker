@@ -311,33 +311,13 @@ fn run_activate<W: Write>(
             None => try_stage!(events, "deps", deps::missing(selected_deps)).is_empty(),
         };
         if alive && satisfied {
-            // On Nix, `install` must still emit its artifact. Short-circuiting
-            // here reported success for an install that wrote nothing, which is
-            // exactly what a preview-then-install does.
-            if mode == ActivateMode::Install
-                && platform == PlatformId::Nix
-                && record.nix.as_ref().is_some_and(|n| n.snippet_path.is_none())
-                && let Some(nix) = record.nix.as_ref()
-            {
-                let snippet = try_stage!(
-                    events,
-                    "record",
-                    platform::write_install_snippet(paths, entry, name, platform::compositor_hint())
-                );
-                step(events, Step::Record, StepState::Start)?;
-                try_stage!(
-                    events,
-                    "record",
-                    do_record_nix(
-                        paths,
-                        name,
-                        entry,
-                        nix.store_path.as_deref(),
-                        &nix.launch_argv,
-                        Some(snippet)
-                    )
-                );
-                step(events, Step::Record, StepState::Done)?;
+            // On Nix, `install` still has to emit its artifact. Delegating rather
+            // than duplicating: the duplicated block wrote the snippet and the
+            // record but never emitted `Event::Config`, so a preview-then-install
+            // reported success and showed no configuration — the one path where
+            // the user most expects to see it.
+            if mode == ActivateMode::Install && platform == PlatformId::Nix {
+                return emit_install_config(paths, events, name, entry);
             }
             events.emit(&Event::Success {
                 active: Some(name.to_string()),

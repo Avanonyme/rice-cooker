@@ -4,7 +4,7 @@
 //! the original implementation relied on exclusively. That path is preserved
 //! here as one of two ways to establish ownership (see [`super::owns_layers`]).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -37,7 +37,7 @@ pub fn layers(signature: &str) -> Option<Vec<LayerSurface>> {
 fn query_layers_json(signature: &str) -> Option<String> {
     // `timeout` bounds a wedged compositor. When it is absent (minimal images,
     // test sandboxes) fall back to a bare `hyprctl` so the call still works.
-    let mut cmd = if which("timeout") {
+    let mut cmd = if crate::platform::which("timeout").is_some() {
         let mut c = Command::new("timeout");
         let secs = format!("{}", IPC_TIMEOUT.as_secs().max(1));
         c.args(["--signal=KILL", &secs, "hyprctl"]);
@@ -55,13 +55,6 @@ fn query_layers_json(signature: &str) -> Option<String> {
         return None;
     }
     String::from_utf8(out.stdout).ok()
-}
-
-fn which(bin: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(bin).is_file())
 }
 
 #[derive(Deserialize)]
@@ -100,13 +93,6 @@ pub fn parse_layers(body: &str) -> Result<Vec<LayerSurface>> {
         }
     }
     Ok(out)
-}
-
-/// A `Path` that is a live Hyprland signature socket, for diagnostics.
-pub fn signature_from_socket(path: &Path) -> Option<String> {
-    path.parent()
-        .and_then(Path::file_name)
-        .map(|s| s.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -168,10 +154,6 @@ mod tests {
             instance_socket(&env, "abc123"),
             None,
             "absent socket must not be reported as present"
-        );
-        assert_eq!(
-            signature_from_socket(Path::new("/run/user/1000/hypr/abc123/.socket.sock")),
-            Some("abc123".to_string())
         );
     }
 

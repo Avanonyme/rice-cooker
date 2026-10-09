@@ -3,10 +3,9 @@
 //! pointer to the active rice.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -86,12 +85,12 @@ impl InstallRecord {
 
 pub fn save_record(path: &Path, r: &InstallRecord) -> Result<()> {
     let body = serde_json::to_string_pretty(r).context("serializing install record")?;
-    atomic_write_fsync(path, body.as_bytes())
+    crate::paths::write_atomic(path, body.as_bytes(), true)
 }
 
 pub fn save_pending_deps(paths: &Paths, pending: &PendingDeps) -> Result<()> {
     let body = serde_json::to_string_pretty(pending).context("serializing pending deps")?;
-    atomic_write_fsync(&paths.pending_deps_json(), body.as_bytes())
+    crate::paths::write_atomic(&paths.pending_deps_json(), body.as_bytes(), true)
 }
 
 pub fn load_pending_deps(paths: &Paths) -> Result<Option<PendingDeps>> {
@@ -131,52 +130,7 @@ pub fn load_record(path: &Path) -> Result<InstallRecord> {
 
 pub fn write_current(paths: &Paths, name: &str) -> Result<()> {
     let body = serde_json::json!({ "name": name }).to_string();
-    atomic_write_fsync(&paths.current_json(), body.as_bytes())
-}
-
-/// Write-to-tmp, fsync file, rename, fsync parent dir. Both fsyncs are needed:
-/// the file's to avoid a post-rename zero-byte window, the parent's so the
-/// rename itself survives power loss. Parent-fsync failure only warns — the
-/// content is durable by then, and erroring here would desync save_record →
-/// write_current (record on disk, current.json skipped, packages orphaned).
-fn atomic_write_fsync(path: &Path, body: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{}: no parent directory", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-
-    let write_then_rename = || -> Result<()> {
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)
-            .with_context(|| format!("opening {}", tmp.display()))?;
-        f.write_all(body)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
-        drop(f);
-        fs::rename(&tmp, path)
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
-    };
-
-    if let Err(e) = write_then_rename() {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    if let Err(e) = fs::File::open(parent).and_then(|d| d.sync_all()) {
-        eprintln!(
-            "rice-cooker: warn: fsync {}: {e} (file content is durable; rename may not survive power loss)",
-            parent.display()
-        );
-    }
-    Ok(())
+    crate::paths::write_atomic(&paths.current_json(), body.as_bytes(), true)
 }
 
 pub fn read_current(paths: &Paths) -> Result<Option<String>> {
